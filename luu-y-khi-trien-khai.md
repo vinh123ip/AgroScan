@@ -4,6 +4,29 @@
 
 ---
 
+## TÓM TẮT NHANH: HIỆN TẠI (PROTOTYPE) VS TRIỂN KHAI THẬT (PRODUCTION)
+
+* **Lưu trữ dữ liệu phiên kiểm định (Inspection Data):**
+  * *Hiện tại:* Lưu tạm trên RAM qua Python Dataclass (`MainWindow._current_session`, tắt app là mất hết dữ liệu).
+  * *Khi deploy thật:* Lưu vĩnh viễn vào SQLite database (`agroscan.db`) qua tầng Repository (`InspectionRepository`).
+* **Mô hình Trí tuệ Nhân tạo (AI Model Engine):**
+  * *Hiện tại:* Giả lập dữ liệu ngẫu nhiên (Mock generator sinh ngẫu nhiên số lượng khuyết tật, score, nhãn DEMO MODE).
+  * *Khi deploy thật:* Tích hợp Model Computer Vision thật (YOLOv8 / YOLOv11 qua ONNX Runtime để phát hiện khuyết tật, sâu bệnh, kích cỡ).
+* **Luồng xử lý suy luận (Thread & Concurrency):**
+  * *Hiện tại:* Chạy timer giả lập giả vờ delay 1-2 giây ngay trên luồng chính.
+  * *Khi deploy thật:* Bắt buộc chạy trên Worker Thread nền (`QRunnable` / `QThreadPool`) để AI tính toán không làm đơ giao diện (freeze GUI).
+* **Quản lý tệp hình ảnh (Image Storage):**
+  * *Hiện tại:* Chỉ đọc đường dẫn file ảnh trực tiếp từ máy người dùng qua `QPixmap`.
+  * *Khi deploy thật:* Copy ảnh vào kho lưu trữ nội bộ (`data/storage/{session_id}/`), kiểm tra mã băm SHA-256 chống trùng lặp, chỉ lưu đường dẫn tương đối (Relative Path) vào database.
+* **Lịch sử & Báo cáo (History & Analytics):**
+  * *Hiện tại:* Danh sách mẫu (Mock 8-10 dòng) + gom danh sách RAM trong phiên làm việc.
+  * *Khi deploy thật:* Truy vấn SQL thực tế (phân trang, lọc theo ngày tháng, mã lô hàng, xuất báo cáo PDF/Excel thật qua ReportLab/OpenPyXL).
+* **Kiểm định viên & Phân quyền (Inspector & Audit):**
+  * *Hiện tại:* Nhập tên tự do trên giao diện New Inspection.
+  * *Khi deploy thật:* Đăng nhập người dùng (User Authentication), phân quyền (Inspector / Supervisor / Admin), lưu vết lịch sử duyệt (Audit Trail).
+
+---
+
 ## 1. TỔNG QUAN KIẾN TRÚC MỤC TIÊU
 
 Hiện tại trong **Phase 2**, hệ thống đang hoạt động ở chế độ **In-Memory** (dữ liệu lưu trên RAM thông qua các dataclass tại [`src/agroscan/models/inspection_models.py`](file:///d:/Github%20Clone/AgroScan/src/agroscan/models/inspection_models.py) và thuật toán AI là giả lập).
