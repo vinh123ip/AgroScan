@@ -26,6 +26,8 @@ from PySide6.QtWidgets import (
 
 from agroscan.ui.components.loading_screen import LoadingScreen
 from agroscan.ui.pages.dashboard_page import DashboardPage
+from agroscan.ui.pages.new_inspection_page import NewInspectionPage
+from agroscan.models.inspection_models import InspectionSession
 
 
 # ---------------------------------------------------------------------------
@@ -35,18 +37,17 @@ from agroscan.ui.pages.dashboard_page import DashboardPage
 # Ordered list of sidebar menu items.
 # Index in this list == QStackedWidget index == navigation row.
 _NAV_ITEMS: list[str] = [
-    "Dashboard",          # 0
-    "New Inspection",     # 1
-    "Inspection History", # 2
-    "Quality Review",     # 3
-    "Reports",            # 4
-    "Settings",           # 5
+    "Dashboard",          # stack index 0
+    "New Inspection",     # stack index 1
+    "Inspection History", # stack index 2
+    "Quality Review",     # stack index 3
+    "Reports",            # stack index 4
+    "Settings",           # stack index 5
 ]
 
 # Pages that simulate an async loading delay (name → estimated real load time ms).
-# Pages NOT listed here are considered lightweight and switch instantly.
+# Pages NOT in this dict switch instantly without a loading screen.
 _HEAVY_PAGES: dict[str, int] = {
-    "New Inspection":     1800,
     "Inspection History": 2200,
     "Quality Review":     2000,
     "Reports":            2400,
@@ -54,6 +55,15 @@ _HEAVY_PAGES: dict[str, int] = {
 
 # QStackedWidget index reserved for the loading screen overlay.
 _LOADING_SCREEN_STACK_INDEX: int = len(_NAV_ITEMS)  # 6
+
+# Workflow step pages (not in sidebar nav — triggered by the inspection wizard).
+# These are appended to QStackedWidget after the loading screen.
+_WORKFLOW_STEP_INDICES: dict[str, int] = {
+    "ImageInput":        7,   # M2.2
+    "DetectionDemo":     8,   # M2.3
+    "QualityAssessment": 9,   # M2.4
+    "HumanReview":       10,  # M2.5
+}
 
 
 # ---------------------------------------------------------------------------
@@ -111,9 +121,12 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(1100, 700)
 
         # Navigation state
-        self._current_nav_index: int  = 0
-        self._pending_nav_index: int  = 0
-        self._is_loading:        bool = False
+        self._current_nav_index: int                   = 0
+        self._pending_nav_index: int                   = 0
+        self._is_loading:        bool                  = False
+
+        # Active inspection session — populated by NewInspectionPage
+        self._current_session: Optional[InspectionSession] = None
 
         self._init_ui()
         self._connect_signals()
@@ -227,12 +240,12 @@ class MainWindow(QMainWindow):
         """
         self.pages = QStackedWidget()
 
-        # Index 0 — Dashboard (real page)
+        # Index 0 — Dashboard (real page, M1)
         self.dashboard_page = DashboardPage()
         self.pages.addWidget(self.dashboard_page)
 
-        # Index 1 — New Inspection (placeholder → M2.1)
-        self.new_inspection_page = _PlaceholderPage("New Inspection")
+        # Index 1 — New Inspection (real page, M2.1)
+        self.new_inspection_page = NewInspectionPage()
         self.pages.addWidget(self.new_inspection_page)
 
         # Index 2 — Inspection History (placeholder → M2.6)
@@ -255,11 +268,70 @@ class MainWindow(QMainWindow):
         self.loading_screen = LoadingScreen()
         self.pages.addWidget(self.loading_screen)
 
+        # ── Inspection workflow steps (not sidebar nav) ─────────────────
+        # Index 7 — Image Input (placeholder → M2.2)
+        self.image_input_page = _PlaceholderPage("Image Input")
+        self.pages.addWidget(self.image_input_page)
+
+        # Index 8 — Detection Demo (placeholder → M2.3)
+        self.detection_demo_page = _PlaceholderPage("Detection Demo")
+        self.pages.addWidget(self.detection_demo_page)
+
+        # Index 9 — Quality Assessment (placeholder → M2.4)
+        self.quality_assessment_page = _PlaceholderPage("Quality Assessment")
+        self.pages.addWidget(self.quality_assessment_page)
+
+        # Index 10 — Human Review (placeholder → M2.5)
+        self.human_review_page = _PlaceholderPage("Human Review")
+        self.pages.addWidget(self.human_review_page)
+
         return self.pages
 
     def _connect_signals(self) -> None:
-        """Kết nối tất cả signal/slot cho navigation."""
+        """Kết nối tất cả signal/slot cho navigation và các trang."""
         self.navigation.currentRowChanged.connect(self._on_nav_row_changed)
+
+        # M2.1 — New Inspection
+        self.new_inspection_page.inspection_started.connect(
+            self._on_inspection_started
+        )
+        self.new_inspection_page.inspection_cancelled.connect(
+            lambda: self._switch_instantly(0, "Dashboard")
+        )
+
+    # ------------------------------------------------------------------
+    # Inspection workflow handlers
+    # ------------------------------------------------------------------
+
+    def _on_inspection_started(self, session: InspectionSession) -> None:
+        """Nhận InspectionSession từ M2.1, lưu lại và chuyển sang M2.2."""
+        self._current_session = session
+        self._navigate_to_workflow_step("ImageInput", session.session_id)
+
+    def _navigate_to_workflow_step(self, step_key: str, session_id: str = "") -> None:
+        """Chuyển đến bước workflow (M2.2–M2.5) không thuộc sidebar nav.
+
+        Args:
+            step_key:   Khoá trong ``_WORKFLOW_STEP_INDICES``.
+            session_id: Session ID hiển thị trên breadcrumb.
+        """
+        step_index = _WORKFLOW_STEP_INDICES.get(step_key)
+        if step_index is None:
+            return
+
+        step_labels: dict[str, str] = {
+            "ImageInput":        "Image Input",
+            "DetectionDemo":     "Detection Demo",
+            "QualityAssessment": "Quality Assessment",
+            "HumanReview":       "Human Review",
+        }
+        label = step_labels.get(step_key, step_key)
+        breadcrumb = f"AgroScan  /  {label}" + (f"  [{session_id}]" if session_id else "")
+        self.breadcrumb.setText(breadcrumb)
+
+        target = self.pages.widget(step_index)
+        if target:
+            self._switch_to_page_with_fade(target)
 
     # ------------------------------------------------------------------
     # Navigation handlers

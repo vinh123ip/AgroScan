@@ -196,3 +196,177 @@ QMainWindow {
     color: #94A3B8;
 }
 
+/* ====================================================
+   NEW INSPECTION PAGE (M2.1)
+   ==================================================== */
+
+#NewInspectionPage {
+    background-color: #0F172A;
+}
+
+#PageScrollArea {
+    background-color: transparent;
+    border: none;
+}
+
+#ScrollContent {
+    background-color: transparent;
+}
+
+/* Form card container */
+#FormCard {
+    background-color: #1E293B;
+    border: 1px solid #334155;
+    border-radius: 16px;
+}
+
+/* Section titles inside the card */
+#FormSectionTitle {
+    font-size: 13px;
+    font-weight: 700;
+    color: #38BDF8;
+    letter-spacing: 1.2px;
+}
+
+/* Form field labels */
+#FormLabel {
+    font-size: 14px;
+    font-weight: 500;
+    color: #CBD5E1;
+    min-width: 148px;
+}
+
+/* Text input fields */
+#FormField,
+#ReadOnlyField,
+#NotesField {
+    background-color: #0F172A;
+    border: 1px solid #334155;
+    border-radius: 8px;
+    color: #F1F5F9;
+    font-size: 14px;
+    padding: 10px 14px;
+    selection-background-color: #38BDF8;
+    selection-color: #0F172A;
+}
+
+#FormField:focus,
+#NotesField:focus {
+    border: 1px solid #38BDF8;
+    background-color: #0B1828;
+}
+
+#FormField:hover,
+#NotesField:hover {
+    border: 1px solid #475569;
+}
+
+/* Read-only session ID field */
+#ReadOnlyField {
+    color: #64748B;
+    background-color: #0B1121;
+    border: 1px solid #1E293B;
+}
+
+/* Combo box */
+#FormCombo {
+    background-color: #0F172A;
+    border: 1px solid #334155;
+    border-radius: 8px;
+    color: #F1F5F9;
+    font-size: 14px;
+    padding: 10px 14px;
+    min-height: 42px;
+}
+
+#FormCombo:focus {
+    border: 1px solid #38BDF8;
+}
+
+#FormCombo:hover {
+    border: 1px solid #475569;
+}
+
+#FormCombo::drop-down {
+    border: none;
+    width: 32px;
+}
+
+#FormCombo QAbstractItemView {
+    background-color: #1E293B;
+    border: 1px solid #334155;
+    border-radius: 8px;
+    color: #F1F5F9;
+    selection-background-color: #38BDF8;
+    selection-color: #0B1121;
+    padding: 4px;
+}
+
+/* Horizontal divider inside form card */
+#FormDivider {
+    color: #334155;
+    background-color: #334155;
+    max-height: 1px;
+    border: none;
+}
+
+/* Inline validation error */
+#InlineErrorLabel {
+    font-size: 14px;
+    font-weight: 500;
+    color: #F87171;
+    background-color: rgba(248, 113, 113, 0.08);
+    border: 1px solid rgba(248, 113, 113, 0.25);
+    border-radius: 8px;
+    padding: 10px 16px;
+}
+
+/* Action buttons */
+#PrimaryButton {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+        stop:0 #0284C7, stop:1 #38BDF8);
+    color: #0B1121;
+    font-size: 14px;
+    font-weight: 700;
+    border: none;
+    border-radius: 8px;
+    padding: 0 24px;
+    letter-spacing: 0.3px;
+}
+
+#PrimaryButton:hover {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+        stop:0 #0369A1, stop:1 #0284C7);
+}
+
+#PrimaryButton:pressed {
+    background: #0284C7;
+}
+
+#SecondaryButton {
+    background-color: transparent;
+    color: #94A3B8;
+    font-size: 14px;
+    font-weight: 500;
+    border: 1px solid #334155;
+    border-radius: 8px;
+    padding: 0 20px;
+}
+
+#SecondaryButton:hover {
+    background-color: #1E293B;
+    color: #F1F5F9;
+    border: 1px solid #475569;
+}
+
+#SecondaryButton:pressed {
+    background-color: #0F172A;
+}
+
+/* ====================================================
+   PLACEHOLDER PAGE (chung cho các trang chưa làm)
+   ==================================================== */
+
+#PlaceholderPage {
+    background-color: #0F172A;
+}
