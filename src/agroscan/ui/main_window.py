@@ -1,4 +1,13 @@
+"""Main application window for AgroScan.
+
+Manages the top-level layout: Sidebar navigation + Header + paged content area.
+Each navigation entry maps 1-to-1 to a QWidget registered in the QStackedWidget.
+As Phase 2 pages are implemented, replace the corresponding _PlaceholderPage
+with the real page class — no other changes needed.
+"""
+
 from pathlib import Path
+from typing import Optional
 
 from PySide6.QtCore import QEasingCurve, QPropertyAnimation, Qt
 from PySide6.QtGui import QFontDatabase
@@ -16,91 +25,186 @@ from PySide6.QtWidgets import (
 )
 
 from agroscan.ui.components.loading_screen import LoadingScreen
-from agroscan.ui.pages.dashboard import DashboardPage
+from agroscan.ui.pages.dashboard_page import DashboardPage
+
+
+# ---------------------------------------------------------------------------
+# Navigation configuration
+# ---------------------------------------------------------------------------
+
+# Ordered list of sidebar menu items.
+# Index in this list == QStackedWidget index == navigation row.
+_NAV_ITEMS: list[str] = [
+    "Dashboard",          # 0
+    "New Inspection",     # 1
+    "Inspection History", # 2
+    "Quality Review",     # 3
+    "Reports",            # 4
+    "Settings",           # 5
+]
+
+# Pages that simulate an async loading delay (name → estimated real load time ms).
+# Pages NOT listed here are considered lightweight and switch instantly.
+_HEAVY_PAGES: dict[str, int] = {
+    "New Inspection":     1800,
+    "Inspection History": 2200,
+    "Quality Review":     2000,
+    "Reports":            2400,
+}
+
+# QStackedWidget index reserved for the loading screen overlay.
+_LOADING_SCREEN_STACK_INDEX: int = len(_NAV_ITEMS)  # 6
+
+
+# ---------------------------------------------------------------------------
+# Internal helper widget
+# ---------------------------------------------------------------------------
+
+
+class _PlaceholderPage(QWidget):
+    """Trang tạm thời cho module chưa triển khai.
+
+    Khi một page thật hoàn thành (M2.x), thay thế instance này trong
+    ``MainWindow._build_page_stack()`` bằng class tương ứng.
+    """
+
+    def __init__(self, page_name: str, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("PlaceholderPage")
+        self._init_ui(page_name)
+
+    def _init_ui(self, page_name: str) -> None:
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(40, 40, 40, 40)
+        layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.setSpacing(12)
+
+        title = QLabel(page_name)
+        title.setObjectName("PageTitle")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        subtitle = QLabel("This module will be developed in the upcoming phase.")
+        subtitle.setObjectName("PageSubtitle")
+        subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        layout.addWidget(title)
+        layout.addWidget(subtitle)
+
+
+# ---------------------------------------------------------------------------
+# Main window
+# ---------------------------------------------------------------------------
 
 
 class MainWindow(QMainWindow):
-    def __init__(self):
+    """Cửa sổ chính của ứng dụng AgroScan.
+
+    Layout:
+        [Sidebar 260px] | [Header 72px + Content area (QStackedWidget)]
+    """
+
+    def __init__(self) -> None:
         super().__init__()
 
         self.setWindowTitle("AgroScan - Inspection Workstation")
         self.resize(1440, 900)
         self.setMinimumSize(1100, 700)
 
+        # Navigation state
+        self._current_nav_index: int  = 0
+        self._pending_nav_index: int  = 0
+        self._is_loading:        bool = False
+
+        self._init_ui()
+        self._connect_signals()
+        self._load_stylesheet()
+
+        # Select Dashboard on startup
+        self.navigation.setCurrentRow(0)
+
+    # ------------------------------------------------------------------
+    # Private init helpers
+    # ------------------------------------------------------------------
+
+    def _init_ui(self) -> None:
+        """Khởi tạo toàn bộ layout root."""
         central = QWidget()
         self.setCentralWidget(central)
 
-        # Root layout chia màn hình thành 2 phần: Sidebar và Content
         root = QHBoxLayout(central)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        # ==================== SIDEBAR ====================
+        root.addWidget(self._build_sidebar())
+        root.addWidget(self._build_content_area())
+
+    def _build_sidebar(self) -> QFrame:
+        """Tạo sidebar chứa brand identity và navigation menu."""
         sidebar = QFrame()
         sidebar.setObjectName("Sidebar")
         sidebar.setFixedWidth(260)
 
-        sidebar_layout = QVBoxLayout(sidebar)
-        sidebar_layout.setContentsMargins(24, 32, 24, 24)
-        sidebar_layout.setSpacing(12)
+        layout = QVBoxLayout(sidebar)
+        layout.setContentsMargins(24, 32, 24, 24)
+        layout.setSpacing(12)
 
-        # Tên thương hiệu
+        # Brand
         brand = QLabel("AgroScan")
         brand.setObjectName("Brand")
 
         brand_subtitle = QLabel("INSPECTION WORKSTATION")
         brand_subtitle.setObjectName("BrandSubtitle")
 
-        sidebar_layout.addWidget(brand)
-        sidebar_layout.addWidget(brand_subtitle)
-        sidebar_layout.addSpacing(32)
+        layout.addWidget(brand)
+        layout.addWidget(brand_subtitle)
+        layout.addSpacing(32)
 
-        # Menu điều hướng (Navigation)
+        # Navigation list
         self.navigation = QListWidget()
         self.navigation.setObjectName("Navigation")
-        self.navigation.setFocusPolicy(Qt.FocusPolicy.NoFocus) # Xóa viền chấm bi khi click
-
-        pages = [
-            "Dashboard",
-            "New Inspection",
-            "Inspection History",
-            "Quality Review",
-            "Reports",
-            "Settings",
-        ]
-
-        for name in pages:
-            item = QListWidgetItem(name)
-            item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
-            self.navigation.addItem(item)
-
-        # Trỏ chuột biến thành hình bàn tay khi hover qua menu
+        self.navigation.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.navigation.setCursor(Qt.CursorShape.PointingHandCursor)
 
-        sidebar_layout.addWidget(self.navigation)
-        sidebar_layout.addStretch()
+        for name in _NAV_ITEMS:
+            item = QListWidgetItem(name)
+            item.setTextAlignment(
+                Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft
+            )
+            self.navigation.addItem(item)
 
-        # Nhãn dưới cùng
-        footer = QLabel("DEMO MODE")
-        footer.setObjectName("DemoBadge")
-        footer.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        sidebar_layout.addWidget(footer)
+        layout.addWidget(self.navigation)
+        layout.addStretch()
 
-        # ==================== MAIN CONTENT ====================
+        # Demo badge
+        demo_badge = QLabel("DEMO MODE")
+        demo_badge.setObjectName("DemoBadge")
+        demo_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(demo_badge)
+
+        return sidebar
+
+    def _build_content_area(self) -> QWidget:
+        """Tạo vùng nội dung chính gồm Header và QStackedWidget."""
         content = QWidget()
         content.setObjectName("Content")
 
-        content_layout = QVBoxLayout(content)
-        content_layout.setContentsMargins(0, 0, 0, 0)
-        content_layout.setSpacing(0)
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
 
-        # Header bar
+        layout.addWidget(self._build_header())
+        layout.addWidget(self._build_page_stack())
+
+        return content
+
+    def _build_header(self) -> QFrame:
+        """Tạo header bar chứa breadcrumb và thông tin người dùng."""
         header = QFrame()
         header.setObjectName("Header")
         header.setFixedHeight(72)
 
-        header_layout = QHBoxLayout(header)
-        header_layout.setContentsMargins(32, 0, 32, 0)
+        layout = QHBoxLayout(header)
+        layout.setContentsMargins(32, 0, 32, 0)
 
         self.breadcrumb = QLabel("AgroScan  /  Dashboard")
         self.breadcrumb.setObjectName("Breadcrumb")
@@ -109,167 +213,169 @@ class MainWindow(QMainWindow):
         user_label.setObjectName("UserLabel")
         user_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-        header_layout.addWidget(self.breadcrumb)
-        header_layout.addStretch()
-        header_layout.addWidget(user_label)
+        layout.addWidget(self.breadcrumb)
+        layout.addStretch()
+        layout.addWidget(user_label)
 
-        # Vùng chứa các trang (Stacked Widget)
+        return header
+
+    def _build_page_stack(self) -> QStackedWidget:
+        """Đăng ký tất cả các trang vào QStackedWidget.
+
+        Thứ tự index phải khớp với ``_NAV_ITEMS``.
+        Khi một page thật hoàn thành, thay _PlaceholderPage tương ứng.
+        """
         self.pages = QStackedWidget()
-        
-        # Trang 1: Dashboard
+
+        # Index 0 — Dashboard (real page)
         self.dashboard_page = DashboardPage()
         self.pages.addWidget(self.dashboard_page)
 
-        # Trang 2: Placeholder cho các trang chưa làm
-        self.placeholder_page = QWidget()
-        self.placeholder_page.setObjectName("DashboardPage")
-        placeholder_layout = QVBoxLayout(self.placeholder_page)
-        placeholder_layout.setContentsMargins(40, 40, 40, 40)
-        placeholder_layout.setSpacing(12)
-        placeholder_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        # Index 1 — New Inspection (placeholder → M2.1)
+        self.new_inspection_page = _PlaceholderPage("New Inspection")
+        self.pages.addWidget(self.new_inspection_page)
 
-        self.placeholder_title = QLabel("Page Under Construction")
-        self.placeholder_title.setObjectName("PageTitle")
-        self.placeholder_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        # Index 2 — Inspection History (placeholder → M2.6)
+        self.inspection_history_page = _PlaceholderPage("Inspection History")
+        self.pages.addWidget(self.inspection_history_page)
 
-        self.placeholder_subtitle = QLabel("This module will be developed in the upcoming phase.")
-        self.placeholder_subtitle.setObjectName("PageSubtitle")
-        self.placeholder_subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        # Index 3 — Quality Review (placeholder → future)
+        self.quality_review_page = _PlaceholderPage("Quality Review")
+        self.pages.addWidget(self.quality_review_page)
 
-        placeholder_layout.addWidget(self.placeholder_title)
-        placeholder_layout.addWidget(self.placeholder_subtitle)
-        self.pages.addWidget(self.placeholder_page)
+        # Index 4 — Reports (placeholder → M2.6 / Phase C)
+        self.reports_page = _PlaceholderPage("Reports")
+        self.pages.addWidget(self.reports_page)
 
-        # Trang 3: Loading Screen chuyển trang
+        # Index 5 — Settings (placeholder → Phase C)
+        self.settings_page = _PlaceholderPage("Settings")
+        self.pages.addWidget(self.settings_page)
+
+        # Index 6 — Loading screen overlay (not a nav target)
         self.loading_screen = LoadingScreen()
         self.pages.addWidget(self.loading_screen)
 
-        content_layout.addWidget(header)
-        content_layout.addWidget(self.pages)
+        return self.pages
 
-        # Thêm Sidebar và Content vào Root
-        root.addWidget(sidebar)
-        root.addWidget(content)
+    def _connect_signals(self) -> None:
+        """Kết nối tất cả signal/slot cho navigation."""
+        self.navigation.currentRowChanged.connect(self._on_nav_row_changed)
 
-        # Trạng thái điều hướng
-        self._current_index = 0
-        self._pending_target_index = 0
-        self._is_loading = False
+    # ------------------------------------------------------------------
+    # Navigation handlers
+    # ------------------------------------------------------------------
 
-        # Xử lý sự kiện click menu
-        self.navigation.currentRowChanged.connect(self.change_page)
-        
-        # Tải giao diện QSS
-        self.load_stylesheet()
-        
-        # Chọn mặc định mục đầu tiên
-        self.navigation.setCurrentRow(0)
-
-    def change_page(self, index: int):
-        if index < 0:
+    def _on_nav_row_changed(self, nav_index: int) -> None:
+        """Xử lý sự kiện click menu sidebar."""
+        if nav_index < 0:
             return
 
-        # 1. Nếu không đang loading và click vào chính trang đang xem -> bỏ qua
-        if not self._is_loading and index == self._current_index:
+        # Đang xem đúng trang này, không đang loading → bỏ qua
+        if not self._is_loading and nav_index == self._current_nav_index:
             return
 
-        # 2. Nếu đang loading trang X và người dùng click lại chính trang X đang load -> bỏ qua (tránh reset)
-        if self._is_loading and index == self._pending_target_index:
+        # Đang loading tới cùng trang đó → bỏ qua (tránh reset)
+        if self._is_loading and nav_index == self._pending_nav_index:
             return
 
-        # 3. Nếu đang loading nhưng người dùng đổi ý bấm quay lại trang hiện tại đang mở:
-        if self._is_loading and index == self._current_index:
-            self.loading_screen.stop()
-            self._is_loading = False
-            self._pending_target_index = self._current_index
-            item = self.navigation.item(self._current_index)
-            cur_name = item.text().strip() if item else "Dashboard"
-            self.breadcrumb.setText(f"AgroScan  /  {cur_name}")
-            target_w = self.dashboard_page if self._current_index == 0 else self.placeholder_page
-            self._switch_to_page_with_transition(target_w)
+        # Đang loading nhưng người dùng nhấn lại trang đang mở → huỷ loading
+        if self._is_loading and nav_index == self._current_nav_index:
+            self._cancel_loading()
             return
 
-        # Dừng ngay tiến trình loading cũ nếu có
+        # Dừng tiến trình loading cũ nếu còn
         self.loading_screen.stop()
 
-        item = self.navigation.item(index)
-        page_name = item.text().strip() if item else "Page"
+        page_name = self._get_page_name(nav_index)
 
-        # 4. Phân loại: Trang nặng (cần tải dữ liệu/mô hình AI) vs Trang nhẹ (mở tức thì)
-        # Trang nhẹ như Settings, Dashboard: chuyển tức thì không cần chờ!
-        heavy_pages = {
-            "New Inspection": 2000,
-            "Inspection History": 2200,
-            "Quality Review": 2000,
-            "Reports": 2400,
-        }
+        if page_name in _HEAVY_PAGES:
+            self._start_loading(nav_index, page_name)
+        else:
+            self._switch_instantly(nav_index, page_name)
 
-        # Nếu là trang KHÔNG CẦN LOADING (ví dụ: Settings, Dashboard khi quay về):
-        if page_name not in heavy_pages:
-            self._is_loading = False
-            self._current_index = index
-            self._pending_target_index = index
-            self.breadcrumb.setText(f"AgroScan  /  {page_name}")
+    def _switch_instantly(self, nav_index: int, page_name: str) -> None:
+        """Chuyển trang nhẹ không cần màn hình loading."""
+        self._is_loading             = False
+        self._current_nav_index      = nav_index
+        self._pending_nav_index      = nav_index
 
-            # Đồng bộ highlight trên Sidebar
-            self.navigation.blockSignals(True)
-            self.navigation.setCurrentRow(index)
-            self.navigation.blockSignals(False)
+        self._sync_sidebar_selection(nav_index)
+        self._update_breadcrumb(page_name)
+        self._switch_to_page_with_fade(self._get_page_widget(nav_index))
 
-            if index == 0:
-                self._switch_to_page_with_transition(self.dashboard_page)
-            else:
-                self.placeholder_title.setText(page_name)
-                self.placeholder_subtitle.setText(f"{page_name} preferences and configurations.")
-                self._switch_to_page_with_transition(self.placeholder_page)
-            return
+    def _start_loading(self, nav_index: int, page_name: str) -> None:
+        """Bắt đầu sequence loading cho trang nặng."""
+        self._pending_nav_index = nav_index
+        self._is_loading        = True
 
-        # 5. Nếu là trang NẶNG (CẦN LOADING 2s):
-        self._pending_target_index = index
-        self._is_loading = True
-
-        # Cập nhật breadcrumb thông báo trạng thái
         self.breadcrumb.setText(f"AgroScan  /  Loading {page_name}...")
+        self.pages.setCurrentIndex(_LOADING_SCREEN_STACK_INDEX)
 
-        # Chuyển sang màn hình Loading
-        self.pages.setCurrentWidget(self.loading_screen)
-
-        est_ms = heavy_pages.get(page_name, 2000)
-
-        # Chuyển trang nhanh gọn với hiệu ứng flash nhẹ (bỏ cd 2s, estimate thực tế giữ nguyên)
+        estimated_ms = _HEAVY_PAGES.get(page_name, 2000)
         self.loading_screen.start(
             page_name=page_name,
-            on_complete=lambda: self._finish_loading(index, page_name),
-            estimated_ms=est_ms,
+            on_complete=lambda: self._on_loading_complete(nav_index, page_name),
+            estimated_ms=estimated_ms,
             transition_ms=280,
         )
 
-    def _finish_loading(self, target_index: int, page_name: str):
-        # Đảm bảo chỉ hoàn tất nếu trang này vẫn là trang mục tiêu cuối cùng người dùng chọn
-        if target_index != self._pending_target_index:
+    def _on_loading_complete(self, nav_index: int, page_name: str) -> None:
+        """Callback sau khi loading screen hoàn tất."""
+        # Bỏ qua nếu người dùng đã chuyển sang trang khác trong lúc loading
+        if nav_index != self._pending_nav_index:
             return
 
-        self._is_loading = False
-        self._current_index = target_index
+        self._is_loading        = False
+        self._current_nav_index = nav_index
 
-        # Cập nhật Breadcrumb hoàn tất
+        self._sync_sidebar_selection(nav_index)
+        self._update_breadcrumb(page_name)
+        self._switch_to_page_with_fade(self._get_page_widget(nav_index))
+
+    def _cancel_loading(self) -> None:
+        """Huỷ loading và quay về trang đang mở."""
+        self.loading_screen.stop()
+        self._is_loading        = False
+        self._pending_nav_index = self._current_nav_index
+
+        page_name = self._get_page_name(self._current_nav_index)
+        self._update_breadcrumb(page_name)
+        self._sync_sidebar_selection(self._current_nav_index)
+        self._switch_to_page_with_fade(self._get_page_widget(self._current_nav_index))
+
+    # ------------------------------------------------------------------
+    # Page resolution helpers
+    # ------------------------------------------------------------------
+
+    def _get_page_name(self, nav_index: int) -> str:
+        """Trả về tên trang từ navigation index."""
+        if 0 <= nav_index < len(_NAV_ITEMS):
+            return _NAV_ITEMS[nav_index]
+        return "Unknown"
+
+    def _get_page_widget(self, nav_index: int) -> QWidget:
+        """Trả về widget trang từ navigation index.
+
+        Navigation index == QStackedWidget index (1-to-1 mapping).
+        """
+        self.pages.setCurrentIndex(nav_index)
+        return self.pages.currentWidget()
+
+    # ------------------------------------------------------------------
+    # UI update helpers
+    # ------------------------------------------------------------------
+
+    def _update_breadcrumb(self, page_name: str) -> None:
         self.breadcrumb.setText(f"AgroScan  /  {page_name}")
 
-        # Đồng bộ highlight trên thanh Sidebar đúng theo trang đích
+    def _sync_sidebar_selection(self, nav_index: int) -> None:
+        """Cập nhật highlight sidebar mà không trigger currentRowChanged."""
         self.navigation.blockSignals(True)
-        self.navigation.setCurrentRow(target_index)
+        self.navigation.setCurrentRow(nav_index)
         self.navigation.blockSignals(False)
 
-        # Chuyển trang thực tế với hiệu ứng flash fade-in mượt mà
-        if target_index == 0:
-            self._switch_to_page_with_transition(self.dashboard_page)
-        else:
-            self.placeholder_title.setText(page_name)
-            self.placeholder_subtitle.setText(f"{page_name} module is scheduled for development in Phase C/D.")
-            self._switch_to_page_with_transition(self.placeholder_page)
-
-    def _switch_to_page_with_transition(self, target_widget: QWidget):
-        """Chuyển sang trang đích với hiệu ứng flash fade-in mượt mà."""
+    def _switch_to_page_with_fade(self, target_widget: QWidget) -> None:
+        """Chuyển sang trang đích với hiệu ứng fade-in mượt mà."""
         self.pages.setCurrentWidget(target_widget)
 
         effect = QGraphicsOpacityEffect(target_widget)
@@ -282,10 +388,16 @@ class MainWindow(QMainWindow):
         anim.setEasingCurve(QEasingCurve.Type.OutCubic)
         anim.finished.connect(lambda: target_widget.setGraphicsEffect(None))
         anim.start(QPropertyAnimation.DeletionPolicy.DeleteWhenStopped)
+
+        # Giữ reference để tránh GC xoá animation sớm
         self._page_transition_anim = anim
 
-    def load_stylesheet(self):
-        # Đảm bảo nạp font Inter nếu chạy độc lập
+    # ------------------------------------------------------------------
+    # Stylesheet
+    # ------------------------------------------------------------------
+
+    def _load_stylesheet(self) -> None:
+        """Nạp font Inter và QSS dark theme vào ứng dụng."""
         fonts_dir = Path(__file__).parent / "resources" / "fonts"
         if fonts_dir.exists():
             for font_file in fonts_dir.glob("*.ttf"):
