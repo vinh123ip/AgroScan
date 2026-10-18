@@ -1,9 +1,3 @@
-"""New Inspection page — M2.1.
-
-Allows the inspector to create a new inspection session and enter
-batch information before proceeding to the image upload step (M2.2).
-"""
-
 from datetime import datetime
 from typing import Optional
 
@@ -26,21 +20,12 @@ from agroscan.models.inspection_models import CommodityType, InspectionSession
 
 
 class NewInspectionPage(QWidget):
-    """M2.1 — Tạo phiên kiểm định mới và nhập thông tin lô hàng.
-
-    Signals:
-        inspection_started(InspectionSession): Phát khi Inspector xác nhận bắt đầu.
-        inspection_cancelled():               Phát khi Inspector huỷ, về Dashboard.
-    """
 
     inspection_started   = Signal(InspectionSession)
     inspection_cancelled = Signal()
 
     _SESSION_ID_PREFIX: str = "INS"
 
-    # ------------------------------------------------------------------
-    # Lifecycle
-    # ------------------------------------------------------------------
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -50,10 +35,6 @@ class NewInspectionPage(QWidget):
         self._init_ui()
         self._connect_signals()
         self._refresh_session_id()
-
-    # ------------------------------------------------------------------
-    # Private init helpers
-    # ------------------------------------------------------------------
 
     def _init_ui(self) -> None:
         """Khởi tạo layout tổng thể với scroll area."""

@@ -1,11 +1,3 @@
-"""Main application window for AgroScan.
-
-Manages the top-level layout: Sidebar navigation + Header + paged content area.
-Each navigation entry maps 1-to-1 to a QWidget registered in the QStackedWidget.
-As Phase 2 pages are implemented, replace the corresponding _PlaceholderPage
-with the real page class — no other changes needed.
-"""
-
 from pathlib import Path
 from typing import Optional
 
@@ -30,45 +22,30 @@ from agroscan.ui.pages.new_inspection_page import NewInspectionPage
 from agroscan.models.inspection_models import InspectionSession
 
 
-# ---------------------------------------------------------------------------
-# Navigation configuration
-# ---------------------------------------------------------------------------
-
-# Ordered list of sidebar menu items.
-# Index in this list == QStackedWidget index == navigation row.
 _NAV_ITEMS: list[str] = [
-    "Dashboard",          # stack index 0
-    "New Inspection",     # stack index 1
-    "Inspection History", # stack index 2
-    "Quality Review",     # stack index 3
-    "Reports",            # stack index 4
-    "Settings",           # stack index 5
+    "Dashboard",          
+    "New Inspection",     
+    "Inspection History", 
+    "Quality Review",     
+    "Reports",            
+    "Settings",           
 ]
 
-# Pages that simulate an async loading delay (name → estimated real load time ms).
-# Pages NOT in this dict switch instantly without a loading screen.
 _HEAVY_PAGES: dict[str, int] = {
     "Inspection History": 2200,
     "Quality Review":     2000,
     "Reports":            2400,
 }
 
-# QStackedWidget index reserved for the loading screen overlay.
 _LOADING_SCREEN_STACK_INDEX: int = len(_NAV_ITEMS)  # 6
 
-# Workflow step pages (not in sidebar nav — triggered by the inspection wizard).
-# These are appended to QStackedWidget after the loading screen.
 _WORKFLOW_STEP_INDICES: dict[str, int] = {
-    "ImageInput":        7,   # M2.2
-    "DetectionDemo":     8,   # M2.3
-    "QualityAssessment": 9,   # M2.4
-    "HumanReview":       10,  # M2.5
+    "ImageInput":        7,   
+    "DetectionDemo":     8,   
+    "QualityAssessment": 9,   
+    "HumanReview":       10,  
 }
 
-
-# ---------------------------------------------------------------------------
-# Internal helper widget
-# ---------------------------------------------------------------------------
 
 
 class _PlaceholderPage(QWidget):
@@ -107,16 +84,12 @@ class _PlaceholderPage(QWidget):
 
 
 class MainWindow(QMainWindow):
-    """Cửa sổ chính của ứng dụng AgroScan.
-
-    Layout:
-        [Sidebar 260px] | [Header 72px + Content area (QStackedWidget)]
-    """
+    """Cửa sổ chính của ứng dụng AgroScan."""
 
     def __init__(self) -> None:
         super().__init__()
 
-        self.setWindowTitle("AgroScan - Inspection Workstation")
+        self.setWindowTitle("AgroScan ")
         self.resize(1440, 900)
         self.setMinimumSize(1100, 700)
 
@@ -134,10 +107,6 @@ class MainWindow(QMainWindow):
 
         # Select Dashboard on startup
         self.navigation.setCurrentRow(0)
-
-    # ------------------------------------------------------------------
-    # Private init helpers
-    # ------------------------------------------------------------------
 
     def _init_ui(self) -> None:
         """Khởi tạo toàn bộ layout root."""
