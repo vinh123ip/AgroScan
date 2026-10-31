@@ -1,6 +1,6 @@
 /* Reset cơ bản */
 QWidget {
-    font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", "Segoe UI Symbol", sans-serif;
 }
 
 /* ====================================================
@@ -369,4 +369,357 @@ QMainWindow {
 
 #PlaceholderPage {
     background-color: #0F172A;
+}
+
+
+/* ====================================================
+   APP SHELL — role-aware sidebar & header (D-032)
+   ==================================================== */
+
+#Navigation::item:disabled {
+    height: 30px;
+    color: #475569;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 1.4px;
+    padding-left: 8px;
+    margin-bottom: 0px;
+    background-color: transparent;
+}
+
+#HeaderNotice {
+    font-size: 13px;
+    font-weight: 600;
+    color: #4ADE80;
+    background-color: rgba(74, 222, 128, 0.10);
+    border: 1px solid rgba(74, 222, 128, 0.30);
+    border-radius: 14px;
+    padding: 6px 14px;
+}
+
+#RoleBadge {
+    font-size: 11px;
+    font-weight: 800;
+    letter-spacing: 1.2px;
+    border-radius: 12px;
+    padding: 6px 12px;
+    color: #0B1121;
+    background-color: #94A3B8;
+}
+#RoleBadge[role="admin"]     { background-color: #F472B6; }
+#RoleBadge[role="inspector"] { background-color: #38BDF8; }
+#RoleBadge[role="reviewer"]  { background-color: #FBBF24; }
+
+#LogoutButton {
+    background-color: transparent;
+    color: #F87171;
+    font-size: 13px;
+    font-weight: 600;
+    border: 1px solid rgba(248, 113, 113, 0.40);
+    border-radius: 8px;
+    padding: 0 16px;
+}
+#LogoutButton:hover {
+    background-color: rgba(248, 113, 113, 0.12);
+    border: 1px solid #F87171;
+}
+
+/* Pages share the content background */
+#BoxIntakePage, #LiveInspectionPage, #AssessmentResultPage,
+#ReviewQueuePage, #SettingsPage {
+    background-color: #0F172A;
+}
+
+#PageScrollArea > QWidget#qt_scrollarea_viewport {
+    background-color: transparent;
+}
+
+#PageTitleSmall {
+    font-size: 28px;
+    font-weight: bold;
+    color: #F8FAFC;
+}
+
+/* ====================================================
+   SHARED COMPONENTS
+   ==================================================== */
+
+#MockBadge {
+    font-size: 10px;
+    font-weight: 800;
+    letter-spacing: 1.2px;
+    color: #FBBF24;
+    background-color: rgba(251, 191, 36, 0.10);
+    border: 1px solid rgba(251, 191, 36, 0.35);
+    border-radius: 6px;
+    padding: 4px 8px;
+}
+
+#StatusBadge {
+    font-size: 12px;
+    font-weight: 800;
+    letter-spacing: 1px;
+    border-radius: 12px;
+    padding: 6px 14px;
+    color: #CBD5E1;
+    background-color: #334155;
+}
+#StatusBadge[tone="good"]     { color: #4ADE80; background-color: rgba(74, 222, 128, 0.12); }
+#StatusBadge[tone="critical"] { color: #F87171; background-color: rgba(248, 113, 113, 0.12); }
+#StatusBadge[tone="warning"]  { color: #FBBF24; background-color: rgba(251, 191, 36, 0.12); }
+#StatusBadge[tone="info"]     { color: #38BDF8; background-color: rgba(56, 189, 248, 0.12); }
+
+#KeyLabel {
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 1px;
+    color: #64748B;
+}
+
+#ValueLabel {
+    font-size: 15px;
+    color: #F1F5F9;
+}
+
+#HintLabel {
+    font-size: 13px;
+    color: #64748B;
+}
+
+#PlaceholderList {
+    font-size: 14px;
+    color: #CBD5E1;
+    line-height: 160%;
+}
+
+#WarningNote {
+    font-size: 13px;
+    font-weight: 500;
+    color: #FBBF24;
+    background-color: rgba(251, 191, 36, 0.08);
+    border: 1px solid rgba(251, 191, 36, 0.25);
+    border-radius: 8px;
+    padding: 10px 14px;
+}
+
+#InfoBanner {
+    background-color: rgba(56, 189, 248, 0.08);
+    border: 1px solid rgba(56, 189, 248, 0.35);
+    border-radius: 12px;
+}
+#InfoBannerText {
+    font-size: 14px;
+    font-weight: 500;
+    color: #BAE6FD;
+}
+
+#ScanField {
+    background-color: #0B1121;
+    border: 2px solid #334155;
+    border-radius: 10px;
+    color: #F8FAFC;
+    font-size: 20px;
+    font-weight: 600;
+    padding: 14px 18px;
+    selection-background-color: #38BDF8;
+    selection-color: #0F172A;
+}
+#ScanField:focus {
+    border: 2px solid #38BDF8;
+}
+
+#FormSpin {
+    background-color: #0F172A;
+    border: 1px solid #334155;
+    border-radius: 8px;
+    color: #F1F5F9;
+    font-size: 14px;
+    padding: 8px 12px;
+    min-height: 24px;
+}
+#FormSpin:focus {
+    border: 1px solid #38BDF8;
+}
+
+#DangerButton {
+    background-color: rgba(248, 113, 113, 0.12);
+    color: #F87171;
+    font-size: 14px;
+    font-weight: 700;
+    border: 1px solid rgba(248, 113, 113, 0.45);
+    border-radius: 8px;
+    padding: 0 20px;
+}
+#DangerButton:hover {
+    background-color: rgba(248, 113, 113, 0.22);
+}
+
+#PassButton {
+    background-color: rgba(74, 222, 128, 0.14);
+    color: #4ADE80;
+    font-size: 14px;
+    font-weight: 700;
+    border: 1px solid rgba(74, 222, 128, 0.45);
+    border-radius: 8px;
+    padding: 0 20px;
+}
+#PassButton:hover {
+    background-color: rgba(74, 222, 128, 0.24);
+}
+
+#PrimaryButton:disabled, #SecondaryButton:disabled, #DangerButton:disabled,
+#PassButton:disabled {
+    background: #1E293B;
+    color: #475569;
+    border: 1px solid #1E293B;
+}
+
+/* Data table */
+#DataTable {
+    background-color: #0F172A;
+    alternate-background-color: #131D31;
+    color: #E2E8F0;
+    border: 1px solid #334155;
+    border-radius: 10px;
+    font-size: 14px;
+    selection-background-color: rgba(56, 189, 248, 0.25);
+    selection-color: #F8FAFC;
+    gridline-color: transparent;
+}
+#DataTable::item {
+    padding-left: 10px;
+}
+#DataTable QHeaderView::section {
+    background-color: #1E293B;
+    color: #94A3B8;
+    font-size: 12px;
+    font-weight: 700;
+    border: none;
+    border-bottom: 1px solid #334155;
+    padding: 10px;
+}
+#DataTable QTableCornerButton::section {
+    background-color: #1E293B;
+    border: none;
+}
+
+#ReviewSplitter::handle {
+    background-color: #1E293B;
+    width: 2px;
+}
+
+#EvidenceThumb {
+    background-color: #0B1121;
+    border: 1px solid #334155;
+    border-radius: 8px;
+    color: #64748B;
+    font-size: 11px;
+    font-weight: 700;
+}
+
+/* Settings connection checks */
+#CheckStatus                  { font-size: 13px; color: #64748B; }
+#CheckStatus[state="running"] { color: #38BDF8; }
+#CheckStatus[state="ok"]      { color: #4ADE80; }
+#CheckStatus[state="error"]   { color: #F87171; }
+
+/* ====================================================
+   LIVE INSPECTION
+   ==================================================== */
+
+#CameraFrame {
+    background-color: #020617;
+    border: 1px solid #334155;
+    border-radius: 12px;
+}
+#NoCameraPanel {
+    background-color: #020617;
+}
+#NoCameraIcon {
+    font-size: 48px;
+    color: #334155;
+}
+#NoCameraTitle {
+    font-size: 22px;
+    font-weight: 700;
+    color: #F1F5F9;
+}
+#RealtimeValue {
+    font-size: 44px;
+    font-weight: 800;
+    color: #38BDF8;
+    min-height: 52px;
+}
+
+/* ====================================================
+   LOGIN & DIALOGS
+   ==================================================== */
+
+#LoginDialog, #AppDialog, #DialogPage {
+    background-color: #0F172A;
+}
+#LoginTitle {
+    font-size: 26px;
+    font-weight: 700;
+    color: #F8FAFC;
+}
+#QuickLoginButton {
+    background-color: #1E293B;
+    color: #F1F5F9;
+    font-size: 13px;
+    font-weight: 600;
+    border: 1px solid #334155;
+    border-radius: 10px;
+}
+#QuickLoginButton:hover {
+    background-color: #273449;
+    border: 1px solid #38BDF8;
+}
+#LinkButton {
+    background: transparent;
+    border: none;
+    color: #38BDF8;
+    font-size: 13px;
+    font-weight: 600;
+}
+#LinkButton:hover {
+    color: #7DD3FC;
+}
+
+/* Scrollbars */
+QScrollBar:vertical {
+    background: transparent;
+    width: 10px;
+    margin: 2px;
+}
+QScrollBar::handle:vertical {
+    background: #334155;
+    border-radius: 4px;
+    min-height: 32px;
+}
+QScrollBar::handle:vertical:hover {
+    background: #475569;
+}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical,
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
+    background: none;
+    height: 0;
+}
+QScrollBar:horizontal {
+    background: transparent;
+    height: 10px;
+    margin: 2px;
+}
+QScrollBar::handle:horizontal {
+    background: #334155;
+    border-radius: 4px;
+    min-width: 32px;
+}
+QScrollBar::handle:horizontal:hover {
+    background: #475569;
+}
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal,
+QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
+    background: none;
+    width: 0;
 }

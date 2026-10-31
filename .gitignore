@@ -179,3 +179,22 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+# ---------------------------------------------------------------------------
+# AgroScan — local data, AI models, captures and exports (never commit)
+# ---------------------------------------------------------------------------
+*.db
+*.sqlite
+*.sqlite3
+*.onnx
+*.pt
+*.pth
+*.engine
+data/
+exports/
+images/
+captures/
+models_ai/
+settings.ini
+
+# JetBrains IDE
+.idea/

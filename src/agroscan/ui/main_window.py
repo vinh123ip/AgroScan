@@ -1,8 +1,13 @@
-from pathlib import Path
-from typing import Optional
+"""Main application window: dynamic role-based sidebar, header, and page registry.
 
-from PySide6.QtCore import QEasingCurve, QPropertyAnimation, Qt
-from PySide6.QtGui import QFontDatabase
+Pages are addressed exclusively by ``PageKey`` (``navigation.py``, P-006). Each
+page is instantiated only when the signed-in role has permission to access it
+(D-032), ensuring restricted pages do not exist in memory for unauthorized roles.
+"""
+
+from typing import Callable, Optional
+
+from PySide6.QtCore import QEasingCurve, QPropertyAnimation, QSize, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QFrame,
     QGraphicsOpacityEffect,
@@ -11,117 +16,174 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QMessageBox,
+    QPushButton,
     QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
 
+from agroscan.models.inspection_models import (
+    BoxCode,
+    InspectionRecord,
+    InspectionSession,
+    Order,
+)
+from agroscan.models.user_models import User
+from agroscan.services.app_settings import AppSettings
+from agroscan.services.mock_auth import MockAuthService
+from agroscan.services.mock_repository import MockRepository
 from agroscan.ui.components.loading_screen import LoadingScreen
+from agroscan.ui.navigation import (
+    PAGE_SPECS,
+    NavSection,
+    PageKey,
+    can_access,
+    get_spec,
+    sidebar_specs,
+)
+from agroscan.ui.pages.assessment_result_page import AssessmentResultPage
+from agroscan.ui.pages.box_intake_page import BoxIntakePage
 from agroscan.ui.pages.dashboard_page import DashboardPage
-from agroscan.ui.pages.new_inspection_page import NewInspectionPage
-from agroscan.models.inspection_models import InspectionSession
+from agroscan.ui.pages.live_inspection_page import LiveInspectionPage
+from agroscan.ui.pages.placeholder_page import PlaceholderPage
+from agroscan.ui.pages.review_queue_page import ReviewQueuePage
+from agroscan.ui.pages.settings_page import SettingsPage
 
 
-_NAV_ITEMS: list[str] = [
-    "Dashboard",          
-    "New Inspection",     
-    "Inspection History", 
-    "Quality Review",     
-    "Reports",            
-    "Settings",           
-]
-
-_HEAVY_PAGES: dict[str, int] = {
-    "Inspection History": 2200,
-    "Quality Review":     2000,
-    "Reports":            2400,
+_PLACEHOLDERS: dict[PageKey, tuple[str, list[str]]] = {
+    PageKey.INSPECTION_HISTORY: (
+        "Search past inspection sessions by box code, date, and product.",
+        [
+            "Search and filter by box code, order, product, status, and date range",
+            "Session detail view with evidence images and reviewer decision",
+            "Full re-inspection history per box",
+        ],
+    ),
+    PageKey.REPORTS: (
+        "Inspection statistics, order-level summaries, and exports.",
+        [
+            "Order-level aggregation, e.g. \"8/10 boxes passed, 1 pending, 1 failed\"",
+            "Daily outcome charts and quality ratios",
+            "PDF and Excel export using unified filter criteria",
+        ],
+    ),
+    PageKey.DATA_IMPORT: (
+        "Import orders, products, inspection criteria, and users.",
+        [
+            "Excel (.xlsx) and CSV import with downloadable templates",
+            "Row-level validation report prior to database commit",
+            "PDF data extraction via the Qwen-VL service",
+        ],
+    ),
+    PageKey.CATALOG: (
+        "Manage products, specialized YOLO models, and defect criteria.",
+        [
+            "Product catalog mapped to dedicated YOLO model files",
+            "Configurable defect thresholds and critical defect classes per product",
+        ],
+    ),
+    PageKey.USERS: (
+        "Manage user accounts and role assignments.",
+        [
+            "Admin, Inspector, and Reviewer account management",
+            "Account activation and status control",
+        ],
+    ),
 }
-
-_LOADING_SCREEN_STACK_INDEX: int = len(_NAV_ITEMS)  # 6
-
-_WORKFLOW_STEP_INDICES: dict[str, int] = {
-    "ImageInput":        7,   
-    "DetectionDemo":     8,   
-    "QualityAssessment": 9,   
-    "HumanReview":       10,  
-}
-
-
-
-class _PlaceholderPage(QWidget):
-    """Trang tạm thời cho module chưa triển khai.
-
-    Khi một page thật hoàn thành (M2.x), thay thế instance này trong
-    ``MainWindow._build_page_stack()`` bằng class tương ứng.
-    """
-
-    def __init__(self, page_name: str, parent: Optional[QWidget] = None) -> None:
-        super().__init__(parent)
-        self.setObjectName("PlaceholderPage")
-        self._init_ui(page_name)
-
-    def _init_ui(self, page_name: str) -> None:
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(40, 40, 40, 40)
-        layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.setSpacing(12)
-
-        title = QLabel(page_name)
-        title.setObjectName("PageTitle")
-        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-
-        subtitle = QLabel("This module will be developed in the upcoming phase.")
-        subtitle.setObjectName("PageSubtitle")
-        subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
-
-        layout.addWidget(title)
-        layout.addWidget(subtitle)
-
-
-# ---------------------------------------------------------------------------
-# Main window
-# ---------------------------------------------------------------------------
 
 
 class MainWindow(QMainWindow):
-    """Cửa sổ chính của ứng dụng AgroScan."""
+    """Primary workstation window displayed after authentication."""
 
-    def __init__(self) -> None:
-        super().__init__()
+    logout_requested = Signal()
 
-        self.setWindowTitle("AgroScan ")
+    _NOTICE_MS = 4500
+    _LOADING_TRANSITION_MS = 280
+    _LOADING_ESTIMATE_MS = 2000
+
+    def __init__(
+        self,
+        user: User,
+        auth_service: MockAuthService,
+        repo: MockRepository,
+        settings: Optional[AppSettings] = None,
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self._user = user
+        self._auth = auth_service
+        self._repo = repo
+        self._settings = settings or AppSettings()
+
+        self.setWindowTitle(f"AgroScan — {user.display_name} ({user.role.value})")
         self.resize(1440, 900)
         self.setMinimumSize(1100, 700)
 
-        # Navigation state
-        self._current_nav_index: int                   = 0
-        self._pending_nav_index: int                   = 0
-        self._is_loading:        bool                  = False
+        self._pages: dict[PageKey, QWidget] = {}
+        self._nav_items: dict[PageKey, QListWidgetItem] = {}
+        self._current_key: Optional[PageKey] = None
+        self._pending_key: Optional[PageKey] = None
+        self._is_loading = False
+        self._assessment_record: Optional[InspectionRecord] = None
 
-        # Active inspection session — populated by NewInspectionPage
-        self._current_session: Optional[InspectionSession] = None
+        self._notice_timer = QTimer(self)
+        self._notice_timer.setSingleShot(True)
 
         self._init_ui()
         self._connect_signals()
-        self._load_stylesheet()
+        self.navigate_to(PageKey.DASHBOARD)
 
-        # Select Dashboard on startup
-        self.navigation.setCurrentRow(0)
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    @property
+    def user(self) -> User:
+        return self._user
+
+    @property
+    def current_page(self) -> Optional[PageKey]:
+        return self._current_key
+
+    def page(self, key: PageKey) -> Optional[QWidget]:
+        """Return the widget for ``key``, or ``None`` if inaccessible to the current role."""
+        return self._pages.get(key)
+
+    def navigate_to(self, key: PageKey) -> bool:
+        """Switch to ``key`` if permitted for the signed-in role."""
+        if key not in self._pages:
+            return False
+
+        if self._is_loading:
+            if key == self._pending_key:
+                return True
+            self._cancel_loading()
+
+        if key == self._current_key and self.page_stack.currentWidget() is self._pages[key]:
+            self._sync_sidebar(key)
+            return True
+
+        if get_spec(key).is_heavy:
+            self._start_loading(key)
+        else:
+            self._show_page(key)
+        return True
+
+    # ------------------------------------------------------------------
+    # UI construction
+    # ------------------------------------------------------------------
 
     def _init_ui(self) -> None:
-        """Khởi tạo toàn bộ layout root."""
         central = QWidget()
         self.setCentralWidget(central)
-
         root = QHBoxLayout(central)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
-
         root.addWidget(self._build_sidebar())
-        root.addWidget(self._build_content_area())
+        root.addWidget(self._build_content_area(), 1)
 
     def _build_sidebar(self) -> QFrame:
-        """Tạo sidebar chứa brand identity và navigation menu."""
         sidebar = QFrame()
         sidebar.setObjectName("Sidebar")
         sidebar.setFixedWidth(260)
@@ -130,320 +192,390 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(24, 32, 24, 24)
         layout.setSpacing(12)
 
-        # Brand
         brand = QLabel("AgroScan")
         brand.setObjectName("Brand")
-
         brand_subtitle = QLabel("INSPECTION WORKSTATION")
         brand_subtitle.setObjectName("BrandSubtitle")
-
         layout.addWidget(brand)
         layout.addWidget(brand_subtitle)
-        layout.addSpacing(32)
+        layout.addSpacing(20)
 
-        # Navigation list
         self.navigation = QListWidget()
         self.navigation.setObjectName("Navigation")
         self.navigation.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.navigation.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.navigation.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.navigation.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._populate_sidebar()
+        layout.addWidget(self.navigation, 1)
 
-        for name in _NAV_ITEMS:
-            item = QListWidgetItem(name)
-            item.setTextAlignment(
-                Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft
-            )
-            self.navigation.addItem(item)
-
-        layout.addWidget(self.navigation)
-        layout.addStretch()
-
-        # Demo badge
         demo_badge = QLabel("DEMO MODE")
         demo_badge.setObjectName("DemoBadge")
         demo_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(demo_badge)
-
         return sidebar
 
+    def _populate_sidebar(self) -> None:
+        """Build sidebar items from ``sidebar_specs(role)``; unauthorized items are omitted (D-032)."""
+        self.navigation.clear()
+        self._nav_items.clear()
+        current_section: Optional[NavSection] = None
+        for spec in sidebar_specs(self._user.role):
+            if spec.section != current_section:
+                current_section = spec.section
+                header = QListWidgetItem(current_section.value)
+                header.setFlags(Qt.ItemFlag.NoItemFlags)
+                header.setSizeHint(QSize(0, 34))
+                self.navigation.addItem(header)
+            item = QListWidgetItem(spec.label)
+            item.setData(Qt.ItemDataRole.UserRole, spec.key)
+            item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+            self.navigation.addItem(item)
+            self._nav_items[spec.key] = item
+
     def _build_content_area(self) -> QWidget:
-        """Tạo vùng nội dung chính gồm Header và QStackedWidget."""
         content = QWidget()
         content.setObjectName("Content")
-
         layout = QVBoxLayout(content)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
-
         layout.addWidget(self._build_header())
-        layout.addWidget(self._build_page_stack())
-
+        layout.addWidget(self._build_page_stack(), 1)
         return content
 
     def _build_header(self) -> QFrame:
-        """Tạo header bar chứa breadcrumb và thông tin người dùng."""
         header = QFrame()
         header.setObjectName("Header")
         header.setFixedHeight(72)
 
         layout = QHBoxLayout(header)
         layout.setContentsMargins(32, 0, 32, 0)
+        layout.setSpacing(12)
 
-        self.breadcrumb = QLabel("AgroScan  /  Dashboard")
+        self.breadcrumb = QLabel("AgroScan")
         self.breadcrumb.setObjectName("Breadcrumb")
-
-        user_label = QLabel("Inspector User")
-        user_label.setObjectName("UserLabel")
-        user_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-
         layout.addWidget(self.breadcrumb)
         layout.addStretch()
-        layout.addWidget(user_label)
 
+        self.notice_label = QLabel("")
+        self.notice_label.setObjectName("HeaderNotice")
+        self.notice_label.setVisible(False)
+        layout.addWidget(self.notice_label, alignment=Qt.AlignmentFlag.AlignVCenter)
+        layout.addSpacing(8)
+
+        self.user_label = QLabel(self._user.display_name)
+        self.user_label.setObjectName("UserLabel")
+        self.user_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.user_label.setToolTip(f"Signed in as {self._user.username}")
+
+        self.role_badge = QLabel(self._user.role.value.upper())
+        self.role_badge.setObjectName("RoleBadge")
+        self.role_badge.setProperty("role", self._user.role.name.lower())
+        self.role_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        self.btn_logout = QPushButton("Logout")
+        self.btn_logout.setObjectName("LogoutButton")
+        self.btn_logout.setFixedHeight(36)
+        self.btn_logout.setCursor(Qt.CursorShape.PointingHandCursor)
+
+        for widget in (self.user_label, self.role_badge, self.btn_logout):
+            layout.addWidget(widget, alignment=Qt.AlignmentFlag.AlignVCenter)
         return header
 
     def _build_page_stack(self) -> QStackedWidget:
-        """Đăng ký tất cả các trang vào QStackedWidget.
-
-        Thứ tự index phải khớp với ``_NAV_ITEMS``.
-        Khi một page thật hoàn thành, thay _PlaceholderPage tương ứng.
-        """
-        self.pages = QStackedWidget()
-
-        # Index 0 — Dashboard (real page, M1)
-        self.dashboard_page = DashboardPage()
-        self.pages.addWidget(self.dashboard_page)
-
-        # Index 1 — New Inspection (real page, M2.1)
-        self.new_inspection_page = NewInspectionPage()
-        self.pages.addWidget(self.new_inspection_page)
-
-        # Index 2 — Inspection History (placeholder → M2.6)
-        self.inspection_history_page = _PlaceholderPage("Inspection History")
-        self.pages.addWidget(self.inspection_history_page)
-
-        # Index 3 — Quality Review (placeholder → future)
-        self.quality_review_page = _PlaceholderPage("Quality Review")
-        self.pages.addWidget(self.quality_review_page)
-
-        # Index 4 — Reports (placeholder → M2.6 / Phase C)
-        self.reports_page = _PlaceholderPage("Reports")
-        self.pages.addWidget(self.reports_page)
-
-        # Index 5 — Settings (placeholder → Phase C)
-        self.settings_page = _PlaceholderPage("Settings")
-        self.pages.addWidget(self.settings_page)
-
-        # Index 6 — Loading screen overlay (not a nav target)
+        self.page_stack = QStackedWidget()
         self.loading_screen = LoadingScreen()
-        self.pages.addWidget(self.loading_screen)
+        self.page_stack.addWidget(self.loading_screen)
 
-        # ── Inspection workflow steps (not sidebar nav) ─────────────────
-        # Index 7 — Image Input (placeholder → M2.2)
-        self.image_input_page = _PlaceholderPage("Image Input")
-        self.pages.addWidget(self.image_input_page)
+        for spec in PAGE_SPECS:
+            if not can_access(self._user.role, spec.key):
+                continue
+            page = self._create_page(spec.key)
+            self._pages[spec.key] = page
+            self.page_stack.addWidget(page)
+        return self.page_stack
 
-        # Index 8 — Detection Demo (placeholder → M2.3)
-        self.detection_demo_page = _PlaceholderPage("Detection Demo")
-        self.pages.addWidget(self.detection_demo_page)
+    def _create_page(self, key: PageKey) -> QWidget:
+        if key == PageKey.DASHBOARD:
+            return DashboardPage(self._repo)
+        if key == PageKey.BOX_INTAKE:
+            return BoxIntakePage(self._repo)
+        if key == PageKey.LIVE_INSPECTION:
+            return LiveInspectionPage(self._settings)
+        if key == PageKey.ASSESSMENT_RESULT:
+            return AssessmentResultPage()
+        if key == PageKey.REVIEW_QUEUE:
+            return ReviewQueuePage(self._repo, self._user)
+        if key == PageKey.SETTINGS:
+            return SettingsPage(self._settings)
+        description, planned = _PLACEHOLDERS.get(key, ("This module is not built yet.", []))
+        return PlaceholderPage(get_spec(key).label, description, planned)
 
-        # Index 9 — Quality Assessment (placeholder → M2.4)
-        self.quality_assessment_page = _PlaceholderPage("Quality Assessment")
-        self.pages.addWidget(self.quality_assessment_page)
+    # Typed accessors for workflow pages (None when the role lacks access)
 
-        # Index 10 — Human Review (placeholder → M2.5)
-        self.human_review_page = _PlaceholderPage("Human Review")
-        self.pages.addWidget(self.human_review_page)
+    @property
+    def box_intake_page(self) -> Optional[BoxIntakePage]:
+        return self._pages.get(PageKey.BOX_INTAKE)  # type: ignore[return-value]
 
-        return self.pages
+    @property
+    def live_inspection_page(self) -> Optional[LiveInspectionPage]:
+        return self._pages.get(PageKey.LIVE_INSPECTION)  # type: ignore[return-value]
+
+    @property
+    def assessment_result_page(self) -> Optional[AssessmentResultPage]:
+        return self._pages.get(PageKey.ASSESSMENT_RESULT)  # type: ignore[return-value]
+
+    @property
+    def review_queue_page(self) -> Optional[ReviewQueuePage]:
+        return self._pages.get(PageKey.REVIEW_QUEUE)  # type: ignore[return-value]
+
+    # ------------------------------------------------------------------
+    # Signals
+    # ------------------------------------------------------------------
 
     def _connect_signals(self) -> None:
-        """Kết nối tất cả signal/slot cho navigation và các trang."""
-        self.navigation.currentRowChanged.connect(self._on_nav_row_changed)
+        self.navigation.itemClicked.connect(self._on_nav_item_clicked)
+        self.btn_logout.clicked.connect(self._on_logout_clicked)
+        self._notice_timer.timeout.connect(lambda: self.notice_label.setVisible(False))
 
-        # M2.1 — New Inspection
-        self.new_inspection_page.inspection_started.connect(
-            self._on_inspection_started
+        review_queue = self.review_queue_page
+        if review_queue is not None:
+            review_queue.review_submitted.connect(self._on_review_submitted)
+
+        intake = self.box_intake_page
+        live = self.live_inspection_page
+        result = self.assessment_result_page
+        if intake is None or live is None or result is None:
+            return
+
+        intake.session_requested.connect(self._on_session_requested)
+        intake.resume_requested.connect(lambda: self.navigate_to(PageKey.LIVE_INSPECTION))
+
+        live.inspection_finished.connect(self._on_inspection_finished)
+        live.next_box_scanned.connect(lambda text: self._on_next_box(text, live.show_error))
+        live.session_discarded.connect(self._on_session_discarded)
+
+        result.submit_requested.connect(self._on_submit_requested)
+        result.back_requested.connect(self._on_back_to_live)
+        result.next_box_scanned.connect(lambda text: self._on_next_box(text, result.show_error))
+
+    def _on_nav_item_clicked(self, item: QListWidgetItem) -> None:
+        key = item.data(Qt.ItemDataRole.UserRole)
+        if isinstance(key, PageKey):
+            self.navigate_to(key)
+
+    def _on_review_submitted(self, record: InspectionRecord) -> None:
+        if record.review is not None:
+            self._show_notice(
+                f"✔  Box {record.session.box_code} marked as {record.review.decision.value}"
+            )
+
+    # ------------------------------------------------------------------
+    # Inspection workflow: Box Intake -> Live Inspection -> Assessment Result
+    # ------------------------------------------------------------------
+
+    def _on_session_requested(self, box_code: BoxCode, order: Order, notes: str) -> None:
+        def warn(message: str) -> None:
+            QMessageBox.warning(self, "Session In Progress", message)
+
+        if self._release_active_session(box_code, warn):
+            self._open_session(box_code, order, notes)
+
+    def _on_next_box(self, text: str, on_error: Callable[[str], None]) -> None:
+        """Handle continuous scanning (D-020): submit current session and open the next box."""
+        try:
+            box_code, order = self._repo.resolve_box(text)
+        except ValueError as exc:
+            on_error(str(exc))
+            return
+        if self._release_active_session(box_code, on_error):
+            self._open_session(box_code, order, "")
+
+    def _release_active_session(
+        self, next_box: BoxCode, on_error: Callable[[str], None]
+    ) -> bool:
+        """Ensure the current session can be closed before opening ``next_box``."""
+        live = self.live_inspection_page
+        current = live.session if live else None
+        if current is None:
+            return True
+        if current.box_code == next_box:
+            on_error(
+                f"Box {next_box} is already open in session {current.session_id}. "
+                "Only one session per box can be open at a time."
+            )
+            return False
+
+        record = self._assessment_record
+        if record is None or record.session is not current:
+            record = live.finalize()
+        if record is None:
+            on_error(
+                f"Box {current.box_code} has no evidence image yet. Capture evidence "
+                "or discard that session before opening another box."
+            )
+            return False
+        self._submit_record(record)
+        return True
+
+    def _open_session(self, box_code: BoxCode, order: Order, notes: str) -> None:
+        station = self._settings.load().station_name
+        session = self._repo.create_session(box_code, order, self._user.username, station)
+        session.notes = notes
+        self._assessment_record = None
+        self.live_inspection_page.start_session(session)
+        self.box_intake_page.reset_form()
+        self.box_intake_page.set_active_session(session)
+        self.navigate_to(PageKey.LIVE_INSPECTION)
+
+    def _submit_record(self, record: InspectionRecord) -> None:
+        """Persist AI recommendation and transition the session to Pending Review (D-020)."""
+        self._repo.submit_for_review(record)
+        self._assessment_record = None
+        self.live_inspection_page.clear_session()
+        self.box_intake_page.set_active_session(None)
+        self._show_notice(f"✔  Box {record.session.box_code} submitted for review")
+
+    def _on_inspection_finished(self, record: InspectionRecord) -> None:
+        self._assessment_record = record
+        self.assessment_result_page.show_record(
+            record, self.live_inspection_page.captured_images
         )
-        self.new_inspection_page.inspection_cancelled.connect(
-            lambda: self._switch_instantly(0, "Dashboard")
-        )
+        self.navigate_to(PageKey.ASSESSMENT_RESULT)
+
+    def _on_back_to_live(self) -> None:
+        # Recompute assessment on next Finish in case new captures were taken
+        self._assessment_record = None
+        self.navigate_to(PageKey.LIVE_INSPECTION)
+
+    def _on_submit_requested(self, record: InspectionRecord) -> None:
+        self._submit_record(record)
+        self.box_intake_page.reset_form()
+        self.navigate_to(PageKey.BOX_INTAKE)
+
+    def _on_session_discarded(self) -> None:
+        self._assessment_record = None
+        self.box_intake_page.set_active_session(None)
+        self.navigate_to(PageKey.BOX_INTAKE)
+
+    def _active_session(self) -> Optional[InspectionSession]:
+        live = self.live_inspection_page
+        return live.session if live else None
 
     # ------------------------------------------------------------------
-    # Inspection workflow handlers
+    # Page switching
     # ------------------------------------------------------------------
 
-    def _on_inspection_started(self, session: InspectionSession) -> None:
-        """Nhận InspectionSession từ M2.1, lưu lại và chuyển sang M2.2."""
-        self._current_session = session
-        self._navigate_to_workflow_step("ImageInput", session.session_id)
-
-    def _navigate_to_workflow_step(self, step_key: str, session_id: str = "") -> None:
-        """Chuyển đến bước workflow (M2.2–M2.5) không thuộc sidebar nav.
-
-        Args:
-            step_key:   Khoá trong ``_WORKFLOW_STEP_INDICES``.
-            session_id: Session ID hiển thị trên breadcrumb.
-        """
-        step_index = _WORKFLOW_STEP_INDICES.get(step_key)
-        if step_index is None:
-            return
-
-        step_labels: dict[str, str] = {
-            "ImageInput":        "Image Input",
-            "DetectionDemo":     "Detection Demo",
-            "QualityAssessment": "Quality Assessment",
-            "HumanReview":       "Human Review",
-        }
-        label = step_labels.get(step_key, step_key)
-        breadcrumb = f"AgroScan  /  {label}" + (f"  [{session_id}]" if session_id else "")
-        self.breadcrumb.setText(breadcrumb)
-
-        target = self.pages.widget(step_index)
-        if target:
-            self._switch_to_page_with_fade(target)
-
-    # ------------------------------------------------------------------
-    # Navigation handlers
-    # ------------------------------------------------------------------
-
-    def _on_nav_row_changed(self, nav_index: int) -> None:
-        """Xử lý sự kiện click menu sidebar."""
-        if nav_index < 0:
-            return
-
-        # Đang xem đúng trang này, không đang loading → bỏ qua
-        if not self._is_loading and nav_index == self._current_nav_index:
-            return
-
-        # Đang loading tới cùng trang đó → bỏ qua (tránh reset)
-        if self._is_loading and nav_index == self._pending_nav_index:
-            return
-
-        # Đang loading nhưng người dùng nhấn lại trang đang mở → huỷ loading
-        if self._is_loading and nav_index == self._current_nav_index:
-            self._cancel_loading()
-            return
-
-        # Dừng tiến trình loading cũ nếu còn
-        self.loading_screen.stop()
-
-        page_name = self._get_page_name(nav_index)
-
-        if page_name in _HEAVY_PAGES:
-            self._start_loading(nav_index, page_name)
-        else:
-            self._switch_instantly(nav_index, page_name)
-
-    def _switch_instantly(self, nav_index: int, page_name: str) -> None:
-        """Chuyển trang nhẹ không cần màn hình loading."""
-        self._is_loading             = False
-        self._current_nav_index      = nav_index
-        self._pending_nav_index      = nav_index
-
-        self._sync_sidebar_selection(nav_index)
-        self._update_breadcrumb(page_name)
-        self._switch_to_page_with_fade(self._get_page_widget(nav_index))
-
-    def _start_loading(self, nav_index: int, page_name: str) -> None:
-        """Bắt đầu sequence loading cho trang nặng."""
-        self._pending_nav_index = nav_index
-        self._is_loading        = True
-
-        self.breadcrumb.setText(f"AgroScan  /  Loading {page_name}...")
-        self.pages.setCurrentIndex(_LOADING_SCREEN_STACK_INDEX)
-
-        estimated_ms = _HEAVY_PAGES.get(page_name, 2000)
+    def _start_loading(self, key: PageKey) -> None:
+        label = get_spec(key).label
+        self._pending_key = key
+        self._is_loading = True
+        self.breadcrumb.setText(f"AgroScan  /  Loading {label}…")
+        self._sync_sidebar(key)
+        self.page_stack.setCurrentWidget(self.loading_screen)
         self.loading_screen.start(
-            page_name=page_name,
-            on_complete=lambda: self._on_loading_complete(nav_index, page_name),
-            estimated_ms=estimated_ms,
-            transition_ms=280,
+            page_name=label,
+            on_complete=lambda: self._on_loading_complete(key),
+            estimated_ms=self._LOADING_ESTIMATE_MS,
+            transition_ms=self._LOADING_TRANSITION_MS,
         )
 
-    def _on_loading_complete(self, nav_index: int, page_name: str) -> None:
-        """Callback sau khi loading screen hoàn tất."""
-        # Bỏ qua nếu người dùng đã chuyển sang trang khác trong lúc loading
-        if nav_index != self._pending_nav_index:
+    def _on_loading_complete(self, key: PageKey) -> None:
+        if not self._is_loading or key != self._pending_key:
             return
-
-        self._is_loading        = False
-        self._current_nav_index = nav_index
-
-        self._sync_sidebar_selection(nav_index)
-        self._update_breadcrumb(page_name)
-        self._switch_to_page_with_fade(self._get_page_widget(nav_index))
+        self._is_loading = False
+        self._pending_key = None
+        self._show_page(key)
 
     def _cancel_loading(self) -> None:
-        """Huỷ loading và quay về trang đang mở."""
         self.loading_screen.stop()
-        self._is_loading        = False
-        self._pending_nav_index = self._current_nav_index
+        self._is_loading = False
+        self._pending_key = None
+        if self._current_key is not None:
+            self.page_stack.setCurrentWidget(self._pages[self._current_key])
+            self._update_breadcrumb(self._current_key)
+            self._sync_sidebar(self._current_key)
 
-        page_name = self._get_page_name(self._current_nav_index)
-        self._update_breadcrumb(page_name)
-        self._sync_sidebar_selection(self._current_nav_index)
-        self._switch_to_page_with_fade(self._get_page_widget(self._current_nav_index))
+    def _show_page(self, key: PageKey) -> None:
+        if key == PageKey.BOX_INTAKE and self.box_intake_page is not None:
+            self.box_intake_page.set_active_session(self._active_session())
+        self._current_key = key
+        self._update_breadcrumb(key)
+        self._sync_sidebar(key)
+        self._fade_to(self._pages[key])
 
-    # ------------------------------------------------------------------
-    # Page resolution helpers
-    # ------------------------------------------------------------------
+    def _update_breadcrumb(self, key: PageKey) -> None:
+        spec = get_spec(key)
+        parts = ["AgroScan"]
+        if spec.parent is not None:
+            parts.append(get_spec(spec.parent).label)
+        parts.append(spec.label)
+        session = self._active_session()
+        text = "  /  ".join(parts)
+        if spec.parent is not None and session is not None:
+            text += f"   ·   {session.session_id}"
+        self.breadcrumb.setText(text)
 
-    def _get_page_name(self, nav_index: int) -> str:
-        """Trả về tên trang từ navigation index."""
-        if 0 <= nav_index < len(_NAV_ITEMS):
-            return _NAV_ITEMS[nav_index]
-        return "Unknown"
-
-    def _get_page_widget(self, nav_index: int) -> QWidget:
-        """Trả về widget trang từ navigation index.
-
-        Navigation index == QStackedWidget index (1-to-1 mapping).
-        """
-        self.pages.setCurrentIndex(nav_index)
-        return self.pages.currentWidget()
-
-    # ------------------------------------------------------------------
-    # UI update helpers
-    # ------------------------------------------------------------------
-
-    def _update_breadcrumb(self, page_name: str) -> None:
-        self.breadcrumb.setText(f"AgroScan  /  {page_name}")
-
-    def _sync_sidebar_selection(self, nav_index: int) -> None:
-        """Cập nhật highlight sidebar mà không trigger currentRowChanged."""
+    def _sync_sidebar(self, key: PageKey) -> None:
+        """Highlight the corresponding sidebar item (or parent item for workflow steps)."""
+        spec = get_spec(key)
+        item = self._nav_items.get(spec.parent or key)
         self.navigation.blockSignals(True)
-        self.navigation.setCurrentRow(nav_index)
+        if item is not None:
+            self.navigation.setCurrentItem(item)
+        else:
+            self.navigation.clearSelection()
         self.navigation.blockSignals(False)
 
-    def _switch_to_page_with_fade(self, target_widget: QWidget) -> None:
-        """Chuyển sang trang đích với hiệu ứng fade-in mượt mà."""
-        self.pages.setCurrentWidget(target_widget)
-
-        effect = QGraphicsOpacityEffect(target_widget)
-        target_widget.setGraphicsEffect(effect)
-
+    def _fade_to(self, target: QWidget) -> None:
+        self.page_stack.setCurrentWidget(target)
+        effect = QGraphicsOpacityEffect(target)
+        target.setGraphicsEffect(effect)
         anim = QPropertyAnimation(effect, b"opacity", self)
         anim.setDuration(240)
         anim.setStartValue(0.15)
         anim.setEndValue(1.0)
         anim.setEasingCurve(QEasingCurve.Type.OutCubic)
-        anim.finished.connect(lambda: target_widget.setGraphicsEffect(None))
+        anim.finished.connect(lambda: target.setGraphicsEffect(None))
         anim.start(QPropertyAnimation.DeletionPolicy.DeleteWhenStopped)
-
-        # Giữ reference để tránh GC xoá animation sớm
         self._page_transition_anim = anim
 
+    def _show_notice(self, text: str) -> None:
+        self.notice_label.setText(text)
+        self.notice_label.setVisible(True)
+        self._notice_timer.start(self._NOTICE_MS)
+
     # ------------------------------------------------------------------
-    # Stylesheet
+    # Logout & shutdown
     # ------------------------------------------------------------------
 
-    def _load_stylesheet(self) -> None:
-        """Nạp font Inter và QSS dark theme vào ứng dụng."""
-        fonts_dir = Path(__file__).parent / "resources" / "fonts"
-        if fonts_dir.exists():
-            for font_file in fonts_dir.glob("*.ttf"):
-                QFontDatabase.addApplicationFont(str(font_file))
+    def _confirm_discard_active_session(self, action: str) -> bool:
+        session = self._active_session()
+        if session is None:
+            return True
+        answer = QMessageBox.question(
+            self, action,
+            f"Session {session.session_id} for box {session.box_code} has not been "
+            f"submitted and will be discarded. {action} anyway?",
+        )
+        return answer == QMessageBox.StandardButton.Yes
 
-        style_path = Path(__file__).parent / "styles" / "dark_theme.qss"
-        if style_path.exists():
-            self.setStyleSheet(style_path.read_text(encoding="utf-8"))
+    def shutdown(self) -> None:
+        """Release camera, loading animation, and active timers prior to teardown."""
+        self.loading_screen.stop()
+        self._notice_timer.stop()
+        if self.live_inspection_page is not None:
+            self.live_inspection_page.clear_session()
+
+    def _on_logout_clicked(self) -> None:
+        if not self._confirm_discard_active_session("Log Out"):
+            return
+        self.shutdown()
+        self.logout_requested.emit()
+
+    def closeEvent(self, event) -> None:  # noqa: N802 — Qt override
+        if not self._confirm_discard_active_session("Exit"):
+            event.ignore()
+            return
+        self.shutdown()
+        super().closeEvent(event)
