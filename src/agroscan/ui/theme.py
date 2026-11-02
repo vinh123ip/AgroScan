@@ -16,6 +16,6 @@ def apply_theme(app: QApplication) -> None:
             QFontDatabase.addApplicationFont(str(font_file))
     app.setFont(QFont("Inter", 10))
 
-    style_path = _UI_DIR / "styles" / "dark_theme.qss"
+    style_path = _UI_DIR / "styles" / "light_theme.qss"
     if style_path.exists():
         app.setStyleSheet(style_path.read_text(encoding="utf-8"))

@@ -44,14 +44,14 @@ class CircularSpinner(QWidget):
 
         rect = self.rect().adjusted(5, 5, -5, -5)
 
-        # Vòng tròn nền mờ Slate (#334155)
-        track_pen = QPen(QColor("#334155"), 4)
+        # Track ring in light slate (#E2E8F0)
+        track_pen = QPen(QColor("#E2E8F0"), 4)
         track_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
         painter.setPen(track_pen)
         painter.drawArc(rect, 0, 360 * 16)
 
-        # Cung tròn active xoay màu xanh Sky (#38BDF8)
-        active_pen = QPen(QColor("#38BDF8"), 4)
+        # Active spinning arc in royal blue (#2563EB)
+        active_pen = QPen(QColor("#2563EB"), 4)
         active_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
         painter.setPen(active_pen)
         painter.drawArc(rect, -self._angle * 16, 110 * 16)
@@ -86,9 +86,9 @@ class LoadingScreen(QWidget):
 
         # Hiệu ứng đổ bóng mờ tạo chiều sâu
         shadow = QGraphicsDropShadowEffect(self.card)
-        shadow.setBlurRadius(36)
-        shadow.setColor(QColor(0, 0, 0, 90))
-        shadow.setOffset(0, 8)
+        shadow.setBlurRadius(32)
+        shadow.setColor(QColor(15, 23, 42, 22))
+        shadow.setOffset(0, 6)
         self.card.setGraphicsEffect(shadow)
 
         card_layout = QVBoxLayout(self.card)
@@ -204,21 +204,20 @@ class LoadingScreen(QWidget):
             self.complete()
 
     def _trigger_completion_flash(self):
-        """Lóe sáng hào quang nhẹ màu Sky (#38BDF8) báo hiệu chuyển trang thành công."""
+        """Subtle royal-blue glow (#2563EB) when page transition completes."""
         shadow = self.card.graphicsEffect()
         if isinstance(shadow, QGraphicsDropShadowEffect):
-            shadow.setColor(QColor(56, 189, 248, 200))
-            shadow.setBlurRadius(54)
+            shadow.setColor(QColor(37, 99, 235, 95))
+            shadow.setBlurRadius(44)
 
         # Nhịp flash nhanh gọn 100ms rồi chuyển cảnh mượt
         QTimer.singleShot(100, self._finalize_completion)
 
     def _finalize_completion(self):
-        # Trả lại màu bóng đổ tối ban đầu
         shadow = self.card.graphicsEffect()
         if isinstance(shadow, QGraphicsDropShadowEffect):
-            shadow.setColor(QColor(0, 0, 0, 90))
-            shadow.setBlurRadius(36)
+            shadow.setColor(QColor(15, 23, 42, 22))
+            shadow.setBlurRadius(32)
 
         callback = self._on_complete_callback
         self.stop()
@@ -232,8 +231,7 @@ class LoadingScreen(QWidget):
         self.spinner.stop()
         self._on_complete_callback = None
 
-        # Đảm bảo trả lại shadow tối nếu bị dừng đột ngột
         shadow = self.card.graphicsEffect()
         if isinstance(shadow, QGraphicsDropShadowEffect):
-            shadow.setColor(QColor(0, 0, 0, 90))
-            shadow.setBlurRadius(36)
+            shadow.setColor(QColor(15, 23, 42, 22))
+            shadow.setBlurRadius(32)

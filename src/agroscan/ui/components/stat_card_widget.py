@@ -38,9 +38,9 @@ class StatCardWidget(QFrame):
     def _init_shadow(self) -> None:
         """Thêm hiệu ứng đổ bóng tạo chiều sâu cho thẻ."""
         shadow = QGraphicsDropShadowEffect(self)
-        shadow.setBlurRadius(20)
-        shadow.setColor(QColor(0, 0, 0, 60))
-        shadow.setOffset(0, 6)
+        shadow.setBlurRadius(24)
+        shadow.setColor(QColor(15, 23, 42, 16))
+        shadow.setOffset(0, 4)
         self.setGraphicsEffect(shadow)
 
     def _init_ui(self, title: str, value: str, note: str) -> None:
