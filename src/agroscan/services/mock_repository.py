@@ -6,8 +6,10 @@ review → reports) works end to end without a database. All data is lost when
 the application closes. Replace with the PostgreSQL data-access layer later.
 """
 
+import copy
 import random
 from collections import defaultdict
+from dataclasses import fields
 from datetime import date, datetime, timedelta
 from typing import Optional
 
@@ -27,6 +29,7 @@ from agroscan.models.inspection_models import (
 )
 from agroscan.models.user_models import Role, User
 from agroscan.services import mock_ai
+from agroscan.services.catalog_validation import validate_product
 from agroscan.services.mock_auth import MockAuthService
 
 
@@ -72,6 +75,57 @@ class MockRepository:
 
     def find_product(self, code: str) -> Optional[Product]:
         return next((p for p in self.products if p.code == code), None)
+
+    def categories(self) -> list[str]:
+        """Danh mục hàng hóa (Goods Category) đang dùng, sắp xếp A–Z."""
+        return sorted({p.category for p in self.products if p.category})
+
+    def orders_for_product(self, code: str) -> list[Order]:
+        return [o for o in self.orders.values() if o.product.code == code]
+
+    def save_product(self, product: Product, original_code: Optional[str] = None) -> Product:
+        """Thêm mới (``original_code=None``) hoặc cập nhật sản phẩm theo mã gốc.
+
+        Cập nhật tại chỗ để các đơn hàng đang tham chiếu dùng ngay tiêu chí mới
+        cho phiên kiểm tra kế tiếp. Mã sản phẩm không đổi được sau khi tạo.
+
+        Raises:
+            ValueError: Cấu hình không hợp lệ (thông điệp gồm mọi lỗi, mỗi lỗi một dòng).
+        """
+        if original_code is not None and product.code != original_code:
+            raise ValueError("Product code cannot be changed after creation.")
+        others = [p.code for p in self.products if p.code != original_code]
+        errors = validate_product(product, others)
+        if errors:
+            raise ValueError("\n".join(errors))
+
+        stored = copy.deepcopy(product)
+        if original_code is None:
+            self.products.append(stored)
+            return stored
+        target = self.find_product(original_code)
+        if target is None:
+            raise ValueError(f"Product {original_code} was not found.")
+        for f in fields(Product):
+            setattr(target, f.name, getattr(stored, f.name))
+        return target
+
+    def delete_product(self, code: str) -> None:
+        """Xóa sản phẩm chưa có đơn hàng nào tham chiếu.
+
+        Raises:
+            ValueError: Không tìm thấy, hoặc còn đơn hàng dùng sản phẩm này.
+        """
+        product = self.find_product(code)
+        if product is None:
+            raise ValueError(f"Product {code} was not found.")
+        orders = self.orders_for_product(code)
+        if orders:
+            raise ValueError(
+                f"{product.name} is used by {len(orders)} order(s) "
+                f"({', '.join(o.order_code for o in orders)}) and cannot be deleted."
+            )
+        self.products.remove(product)
 
     def resolve_box(self, text: str) -> tuple[BoxCode, Order]:
         """Xác thực mã hộp quét được với danh sách đơn hàng.
@@ -227,8 +281,17 @@ class MockRepository:
 
         detection = mock_ai.simulate_detection(order.product, self._rng)
         assessment = mock_ai.assess_quality(order.product, detection)
+        deep_analysis = (
+            mock_ai.simulate_deep_analysis(session, detection, rng=self._rng)
+            if assessment.recommendation != AiRecommendation.PASS or not review
+            else None
+        )
         record = InspectionRecord(
-            session, [EvidenceImage(started + timedelta(minutes=2))], detection, assessment
+            session,
+            [EvidenceImage(started + timedelta(minutes=2))],
+            detection,
+            assessment,
+            deep_analysis=deep_analysis,
         )
         self.submit_for_review(record)
         if review:

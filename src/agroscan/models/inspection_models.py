@@ -14,6 +14,8 @@ from datetime import datetime
 from enum import Enum
 from typing import Optional
 
+from agroscan.models.vlm_models import VlmAnalysis
+
 
 # ---------------------------------------------------------------------------
 # Enumerations
@@ -217,7 +219,7 @@ class InspectionRecord:
     evidence:      list[EvidenceImage]
     detection:     DetectionResult
     assessment:    QualityAssessmentResult
-    deep_analysis: str = ""                    # Nhận xét Qwen-VL (nếu có)
+    deep_analysis: Optional[VlmAnalysis] = None   # Kết quả Qwen-VL schema 1.0 (nếu có)
     review:        Optional[ReviewRecord] = None
 
     @property

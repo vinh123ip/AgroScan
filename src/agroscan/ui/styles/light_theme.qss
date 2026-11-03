@@ -128,6 +128,7 @@ QToolTip {
 #LiveInspectionPage,
 #AssessmentResultPage,
 #ReviewQueuePage,
+#CatalogPage,
 #SettingsPage,
 #PlaceholderPage,
 #NewInspectionPage {
@@ -638,6 +639,54 @@ QMessageBox QPushButton:hover {
     font-size: 14px;
     font-weight: 600;
     color: #1E40AF;
+}
+
+/* VLM Result Panel (schema 1.0) */
+#VlmValue {
+    font-size: 13px;
+    font-weight: 500;
+    color: #0F172A;
+}
+
+#VlmCritical {
+    font-size: 13px;
+    font-weight: 700;
+    color: #B91C1C;
+}
+
+#VlmMismatch {
+    font-size: 12px;
+    font-weight: 700;
+    color: #B45309;
+    background-color: #FFFBEB;
+    border: 1px solid #FDE68A;
+    border-radius: 6px;
+    padding: 3px 8px;
+}
+
+#VlmErrorBox {
+    background-color: #FEF2F2;
+    border: 1px solid #FECACA;
+    border-radius: 10px;
+}
+
+#VlmErrorTitle {
+    font-size: 14px;
+    font-weight: 700;
+    color: #B91C1C;
+}
+
+#VlmErrorText {
+    font-size: 13px;
+    font-weight: 500;
+    color: #7F1D1D;
+}
+
+QCheckBox {
+    font-size: 13px;
+    font-weight: 600;
+    color: #1E293B;
+    spacing: 8px;
 }
 
 /* ====================================================

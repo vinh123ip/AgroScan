@@ -46,7 +46,12 @@ class StatusBadge(QLabel):
     def set_value(self, value: Optional[Enum], text: Optional[str] = None) -> None:
         tone = tone_of(value)
         label = text or (value.value if value else "—")
-        self.setText(f"{_ICONS[tone]}  {label.upper()}")
+        self.set_tone(tone, label)
+
+    def set_tone(self, tone: str, text: str) -> None:
+        """Hiển thị nhãn tùy ý với một tone có sẵn (good/critical/warning/info/neutral)."""
+        tone = tone if tone in _ICONS else "neutral"
+        self.setText(f"{_ICONS[tone]}  {text.upper()}")
         self.setProperty("tone", tone)
         self.style().unpolish(self)
         self.style().polish(self)

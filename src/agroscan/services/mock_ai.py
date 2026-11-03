@@ -9,14 +9,25 @@ replaced by the real engine reading criteria from the database. The order in
 which rules are evaluated is not yet confirmed by the user.
 """
 
+import json
 import random
+from datetime import datetime, timedelta
+from enum import Enum
 from typing import Optional
 
 from agroscan.models.inspection_models import (
     AiRecommendation,
     DetectionResult,
+    InspectionSession,
     Product,
     QualityAssessmentResult,
+)
+from agroscan.models.vlm_models import (
+    SCHEMA_VERSION,
+    VlmAnalysis,
+    VlmErrorCode,
+    VlmSchemaError,
+    parse_vlm_response,
 )
 
 
@@ -84,19 +95,141 @@ def assess_quality(product: Product, detection: DetectionResult) -> QualityAsses
     )
 
 
-def simulate_deep_analysis(product: Product, detection: DetectionResult) -> str:
-    """Nhận xét kiểu Qwen-VL giả lập, tách quan sát / nhận định / độ chắc chắn."""
-    defects = [
-        f"{count} {cls}" for cls, count in detection.class_counts.items()
-        if cls != product.detect_classes[0] and count > 0
-    ]
-    observed = ", ".join(defects) if defects else "no visible defects"
-    return (
-        f"Observations: {detection.total_objects} {product.name.lower()} units visible; "
-        f"{observed}.\n"
-        "Assessment: surface discoloration is consistent with handling bruises; "
-        "no mold texture identified.\n"
-        f"Uncertainty: moderate — mean detector confidence "
-        f"{detection.mean_confidence:.0%}, partial occlusion at box edges.\n"
-        "Suggestion: rotate the top layer and capture one more image if in doubt."
-    )
+class VlmScenario(Enum):
+    """Demo outcomes of a simulated Qwen-VL call, used to show every panel state."""
+
+    NORMAL              = "Normal result"
+    LABEL_UNREADABLE    = "Partial — label unreadable"
+    IMAGE_UNUSABLE      = "Error — image unusable"
+    TIMEOUT             = "Error — timeout"
+    SERVICE_UNAVAILABLE = "Error — service unavailable"
+    INVALID_RESPONSE    = "Error — invalid response"
+
+
+_SEVERITY_BY_CLASS = {"rotten": "critical", "moldy": "critical", "bruised": "minor"}
+
+
+def _simulated_payload(
+    session: InspectionSession,
+    detection: DetectionResult,
+    scenario: VlmScenario,
+    rng: random.Random,
+) -> dict:
+    """Schema-1.0 body the Qwen-VL service would return (D-017)."""
+    product = session.product
+    now = datetime.now()
+    base = {
+        "schema_version": SCHEMA_VERSION,
+        "request_id":     f"vlm-{now:%Y%m%d%H%M%S}-{rng.randint(100, 999)}",
+        "model":          "qwen2.5-vl-7b-instruct (simulated)",
+        "latency_ms":     rng.randint(900, 2400),
+        "analyzed_at":    now.isoformat(timespec="seconds"),
+    }
+    if scenario == VlmScenario.IMAGE_UNUSABLE:
+        return {**base, "status": "error", "error": {
+            "code": "IMAGE_UNUSABLE",
+            "message": "The image is too blurred to analyze — the box surface is not in focus.",
+            "retryable": False,
+        }}
+
+    critical = {c.defect_class for c in product.criteria if c.is_critical}
+    defects = []
+    for cls, count in detection.class_counts.items():
+        if cls == product.detect_classes[0] or count == 0:
+            continue
+        severity = "critical" if cls in critical else _SEVERITY_BY_CLASS.get(cls, "major")
+        defects.append({
+            "defect_class": cls,
+            "count":        count,
+            "severity":     severity,
+            "confidence":   round(rng.uniform(0.62, 0.93), 2),
+            "description":  (
+                "Dark soft patches with sunken skin." if severity == "critical"
+                else "Surface discoloration consistent with handling bruises."
+            ),
+            "region": [round(rng.uniform(0.05, 0.6), 2), round(rng.uniform(0.05, 0.6), 2), 0.2, 0.2],
+        })
+
+    supplier = session.order.supplier
+    if rng.random() < 0.15:
+        supplier = "Unknown Packer Ltd."   # Demo: label differs from the order
+    label_readable = scenario != VlmScenario.LABEL_UNREADABLE
+    ocr_fields = [
+        {"key": "box_code",    "value": session.box_code.text,                  "confidence": 0.97},
+        {"key": "supplier",    "value": supplier,                               "confidence": 0.88},
+        {"key": "packed_date", "value": f"{now - timedelta(days=2):%Y-%m-%d}", "confidence": 0.81},
+        {"key": "lot_number",  "value": f"LOT-{rng.randint(1000, 9999)}",       "confidence": 0.74},
+        {"key": "origin",      "value": "Viet Nam",                             "confidence": 0.92},
+    ] if label_readable else []
+
+    uncertainty_score = round(min(1.0, 1.0 - detection.mean_confidence + rng.uniform(0.0, 0.15)), 2)
+    level = "low" if uncertainty_score < 0.3 else "medium" if uncertainty_score < 0.55 else "high"
+    reasons = [f"Mean detector confidence {detection.mean_confidence:.0%}."]
+    if level != "low":
+        reasons.append("Partial occlusion at the box edges.")
+    if not label_readable:
+        reasons.append("Box label could not be read.")
+
+    observed = ", ".join(f"{d['count']} {d['defect_class']}" for d in defects) or "no visible defects"
+    return {
+        **base,
+        "status": "ok" if label_readable else "partial",
+        "defects": defects,
+        "ocr": {
+            "readable": label_readable,
+            "fields":   ocr_fields,
+            "raw_text": "\n".join(f["value"] for f in ocr_fields),
+        },
+        "observations": [
+            f"{detection.total_objects} {product.name.lower()} units visible.",
+            f"Defects seen: {observed}.",
+        ],
+        "assessment": (
+            "Critical decay is present; the box is unlikely to meet the criteria."
+            if any(d["severity"] == "critical" for d in defects)
+            else "Surface marks are consistent with handling; no mold texture identified."
+        ),
+        "uncertainty": {"level": level, "score": uncertainty_score, "reasons": reasons},
+        "suggestion": (
+            "Rotate the top layer and capture one more image."
+            if level != "low" else "No further action needed."
+        ),
+        "warnings": [] if label_readable else ["OCR skipped: label glare or out of frame."],
+        "error": None,
+    }
+
+
+def simulate_deep_analysis(
+    session: InspectionSession,
+    detection: DetectionResult,
+    scenario: VlmScenario = VlmScenario.NORMAL,
+    timeout_s: int = 30,
+    rng: Optional[random.Random] = None,
+) -> VlmAnalysis:
+    """Simulated Qwen-VL client call. Always returns a ``VlmAnalysis`` (never raises).
+
+    Transport failures become client-side ERROR results, and the server body is
+    validated with ``parse_vlm_response`` exactly as the real client must do.
+    """
+    rng = rng or random.Random()
+    if scenario == VlmScenario.TIMEOUT:
+        result = VlmAnalysis.client_error(
+            VlmErrorCode.TIMEOUT, f"The AI service did not respond within {timeout_s} s."
+        )
+    elif scenario == VlmScenario.SERVICE_UNAVAILABLE:
+        result = VlmAnalysis.client_error(
+            VlmErrorCode.SERVICE_UNAVAILABLE,
+            "Cannot reach the AI service. Check the server address in Settings.",
+        )
+    else:
+        payload = _simulated_payload(session, detection, scenario, rng)
+        if scenario == VlmScenario.INVALID_RESPONSE:
+            payload["uncertainty"] = {"level": "unsure", "score": 1.7}   # Violates schema
+        try:
+            result = parse_vlm_response(json.dumps(payload))
+        except VlmSchemaError as exc:
+            result = VlmAnalysis.client_error(
+                VlmErrorCode.INVALID_RESPONSE, f"The AI service returned invalid data — {exc}"
+            )
+    result.is_simulated = True
+    return result
