@@ -623,6 +623,28 @@ QMainWindow {
 #CheckStatus[state="ok"]      { color: #4ADE80; }
 #CheckStatus[state="error"]   { color: #F87171; }
 
+/* VLM Result Panel (schema 1.0) & Catalog */
+#CatalogPage { background-color: #0F172A; }
+#VlmValue    { font-size: 13px; font-weight: 500; color: #E2E8F0; }
+#VlmCritical { font-size: 13px; font-weight: 700; color: #F87171; }
+#VlmMismatch {
+    font-size: 12px;
+    font-weight: 700;
+    color: #FBBF24;
+    background-color: rgba(251, 191, 36, 0.14);
+    border: 1px solid rgba(251, 191, 36, 0.45);
+    border-radius: 6px;
+    padding: 3px 8px;
+}
+#VlmErrorBox {
+    background-color: rgba(248, 113, 113, 0.10);
+    border: 1px solid rgba(248, 113, 113, 0.40);
+    border-radius: 10px;
+}
+#VlmErrorTitle { font-size: 14px; font-weight: 700; color: #F87171; }
+#VlmErrorText  { font-size: 13px; font-weight: 500; color: #FECACA; }
+QCheckBox      { font-size: 13px; font-weight: 600; color: #E2E8F0; spacing: 8px; }
+
 /* ====================================================
    LIVE INSPECTION
    ==================================================== */

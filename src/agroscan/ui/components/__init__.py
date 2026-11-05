@@ -7,8 +7,10 @@ to handle.
 
 from agroscan.ui.components.loading_screen import LoadingScreen
 from agroscan.ui.components.stat_card_widget import StatCardWidget
+from agroscan.ui.components.vlm_result_panel import VlmResultPanel
 
 __all__ = [
     "LoadingScreen",
     "StatCardWidget",
+    "VlmResultPanel",
 ]

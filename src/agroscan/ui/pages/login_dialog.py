@@ -136,8 +136,8 @@ class LoginDialog(QDialog):
             return
         user = self._auth.authenticate(self.username.text(), self.password.text())
         if user is None:
-            self._show_error("Incorrect username or password.")
             self.password.clear()
+            self._show_error("Incorrect username or password.")
             return
         self.user = user
         self.accept()

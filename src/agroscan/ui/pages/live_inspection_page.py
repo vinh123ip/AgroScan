@@ -24,13 +24,13 @@ from PySide6.QtMultimedia import (
 )
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
+    QComboBox,
     QFrame,
     QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QMessageBox,
-    QPlainTextEdit,
     QPushButton,
     QScrollArea,
     QStackedWidget,
@@ -44,11 +44,13 @@ from agroscan.models.inspection_models import (
     InspectionRecord,
     InspectionSession,
 )
+from agroscan.models.vlm_models import VlmAnalysis
 from agroscan.services import mock_ai
 from agroscan.services.app_settings import AppSettings
 from agroscan.ui.components.evidence_strip import EvidenceStrip
 from agroscan.ui.components.page_layout import SectionCard, make_hint
 from agroscan.ui.components.status_badge import StatusBadge
+from agroscan.ui.components.vlm_result_panel import VlmResultPanel
 
 
 class LiveInspectionPage(QWidget):
@@ -70,7 +72,7 @@ class LiveInspectionPage(QWidget):
         self._evidence: list[EvidenceImage] = []
         self._images: list[QImage] = []
         self._detection: Optional[DetectionResult] = None
-        self._deep_analysis: str = ""
+        self._deep_analysis: Optional[VlmAnalysis] = None
         self._analysis_token = 0
         self._is_analyzing = False
         self._frame_history: dict[str, deque] = {}
@@ -213,21 +215,30 @@ class LiveInspectionPage(QWidget):
         realtime.body.addWidget(self.model_label)
         layout.addWidget(realtime)
 
-        # Deep analysis
+        # Deep analysis (VLM Result Panel, schema 1.0)
         self.deep_card = SectionCard("Deep Analysis")
         self.deep_suggestion = QLabel("▲  Low detection confidence — deep analysis recommended.")
         self.deep_suggestion.setObjectName("WarningNote")
         self.deep_suggestion.setWordWrap(True)
         self.deep_suggestion.setVisible(False)
-        self.deep_text = QPlainTextEdit()
-        self.deep_text.setObjectName("NotesField")
-        self.deep_text.setReadOnly(True)
-        self.deep_text.setPlaceholderText(
-            "Press Deep Analysis to request a detailed review of the latest capture."
+        self.vlm_panel = VlmResultPanel()
+        scenario_row = QHBoxLayout()
+        scenario_row.setSpacing(8)
+        scenario_label = QLabel("Demo outcome")
+        scenario_label.setObjectName("FormLabel")
+        self.scenario_combo = QComboBox()
+        self.scenario_combo.setObjectName("FormCombo")
+        self.scenario_combo.setToolTip(
+            "DEMO MODE only: choose what the simulated AI service returns, "
+            "to preview every state of the result panel."
         )
-        self.deep_text.setMinimumHeight(120)
+        for scenario in mock_ai.VlmScenario:
+            self.scenario_combo.addItem(scenario.value, userData=scenario)
+        scenario_row.addWidget(scenario_label)
+        scenario_row.addWidget(self.scenario_combo, 1)
         self.deep_card.body.addWidget(self.deep_suggestion)
-        self.deep_card.body.addWidget(self.deep_text)
+        self.deep_card.body.addWidget(self.vlm_panel)
+        self.deep_card.body.addLayout(scenario_row)
         layout.addWidget(self.deep_card, 1)
 
         # Next box (D-020)
@@ -265,6 +276,8 @@ class LiveInspectionPage(QWidget):
         self.btn_retry_camera.clicked.connect(self._start_camera)
         self.btn_capture.clicked.connect(self._on_capture)
         self.btn_deep.clicked.connect(self._on_deep_analysis)
+        self.vlm_panel.retry_requested.connect(self._on_deep_analysis)
+        self.vlm_panel.cancel_requested.connect(self._on_cancel_deep_analysis)
         self.btn_finish.clicked.connect(self._on_finish)
         self.btn_discard.clicked.connect(self._on_discard)
         self.next_scan_field.returnPressed.connect(self._on_next_scanned)
@@ -285,8 +298,10 @@ class LiveInspectionPage(QWidget):
     def start_session(self, session: InspectionSession) -> None:
         self._session = session
         self._evidence, self._images = [], []
-        self._detection, self._deep_analysis = None, ""
+        self._detection, self._deep_analysis = None, None
         self._analysis_token += 1
+        self._is_analyzing = False
+        self.btn_deep.setText("Deep Analysis (Qwen-VL)")
         self._frame_history = {
             cls: deque(maxlen=self._SMOOTHING_FRAMES) for cls in session.product.detect_classes
         }
@@ -301,7 +316,7 @@ class LiveInspectionPage(QWidget):
         )
         self._build_realtime_rows(session.product.detect_classes)
         self.evidence_strip.set_evidence([])
-        self.deep_text.clear()
+        self.vlm_panel.set_idle()
         self.deep_suggestion.setVisible(False)
         self.next_scan_field.clear()
         self.error_label.setVisible(False)
@@ -325,6 +340,9 @@ class LiveInspectionPage(QWidget):
     def clear_session(self) -> None:
         self._session = None
         self._analysis_token += 1
+        self._is_analyzing = False
+        self.btn_deep.setText("Deep Analysis (Qwen-VL)")
+        self.vlm_panel.set_idle()
         self._stop_camera()
         self.session_label.setText("No active session")
         self.status_badge.set_value(None)
@@ -463,17 +481,45 @@ class LiveInspectionPage(QWidget):
         self._is_analyzing = True
         self.btn_deep.setEnabled(False)
         self.btn_deep.setText("Analyzing…")
-        self.deep_text.setPlainText("Waiting for AI service response…")
+        self.vlm_panel.set_loading()
         QTimer.singleShot(self._DEEP_ANALYSIS_MS, lambda: self._on_deep_analysis_done(token))
 
-    def _on_deep_analysis_done(self, token: int) -> None:
+    def _on_cancel_deep_analysis(self) -> None:
+        self._analysis_token += 1          # Late response is ignored (token mismatch)
         self._is_analyzing = False
         self.btn_deep.setText("Deep Analysis (Qwen-VL)")
         self._update_buttons()
-        if token != self._analysis_token or self._session is None or self._detection is None:
+        if self._deep_analysis is not None:
+            self.vlm_panel.set_analysis(self._deep_analysis, self._expected_label_values())
+        else:
+            self.vlm_panel.set_idle("Deep analysis cancelled. Press Deep Analysis to try again.")
+
+    def _on_deep_analysis_done(self, token: int) -> None:
+        if token != self._analysis_token:
+            return                         # Cancelled or superseded
+        self._is_analyzing = False
+        self.btn_deep.setText("Deep Analysis (Qwen-VL)")
+        self._update_buttons()
+        if self._session is None or self._detection is None:
             return
-        self._deep_analysis = mock_ai.simulate_deep_analysis(self._session.product, self._detection)
-        self.deep_text.setPlainText("[SIMULATED]\n" + self._deep_analysis)
+        result = mock_ai.simulate_deep_analysis(
+            self._session,
+            self._detection,
+            scenario=self.scenario_combo.currentData(),
+            timeout_s=self._settings.load().ai_timeout_s,
+        )
+        if not result.is_error:
+            self._deep_analysis = result   # Errors are shown but never stored in the record
+        self.vlm_panel.set_analysis(result, self._expected_label_values())
+
+    def _expected_label_values(self) -> dict[str, str]:
+        """Giá trị theo đơn hàng để panel đánh dấu nhãn OCR khác khai báo (chỉ hiển thị)."""
+        if self._session is None:
+            return {}
+        return {
+            "box_code": self._session.box_code.text,
+            "supplier": self._session.order.supplier,
+        }
 
     def _on_finish(self) -> None:
         record = self.finalize()

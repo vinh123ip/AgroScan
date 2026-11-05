@@ -4,7 +4,7 @@
 
 AI cập nhật tệp này sau mỗi nhiệm vụ thuộc roadmap và ghi rõ phần nào chưa kiểm chứng.
 
-**Cập nhật lần cuối:** 01/11/2026
+**Cập nhật lần cuối:** 04/11/2026
 
 ## Trạng thái
 
@@ -53,6 +53,7 @@ Việc AI cần làm ở phiên đầu (chỉ đọc, **không sửa tệp**):
 | 01/11/2026 | Phiên hỏi đáp làm rõ yêu cầu: chốt 15 quyết định mới (D-016 → D-029), đóng Q-001/Q-002/Q-007, hủy P-005 | Cập nhật `DECISIONS.md`, `PROJECT.md`, `PROGRESS.md` | File đã ghi, chưa commit | Khảo sát repo, lập kế hoạch triển khai |
 | 01/11/2026 | Chốt D-030 (trạng thái), D-031 (camera-first + sim feed), D-032 (dynamic RBAC); phát hiện mã nguồn đang dở dang giữa Bước 2 và 3 | Ghi nhận D-030→D-032; đã tạo các module trang mới và services | `python run.py` văng `ImportError: CommodityType` do `main_window.py` chưa nối `navigation.py` | Ráp nối `main_window.py` & `main.py` với `navigation.py`, hoàn thiện UI shell |
 | 01/11/2026 | Ráp nối `main_window.py`, `main.py`, `placeholder_page.py`, `dark_theme.qss`; gỡ xung đột `new_inspection_page.py` | Khởi chạy hoàn chỉnh luồng `LoginDialog` ↔ `MainWindow` theo `PageKey` và phân quyền động D-032 (3 vai trò), nối luồng `BoxIntake` → `LiveInspection` → `AssessmentResult` → `ReviewQueue` (mock RAM) | Chạy pass toàn bộ smoke test & vòng lặp `run.py` trên `QT_QPA_PLATFORM=offscreen` (01/11/2026) | Bổ sung toggle simulation feed D-031 trong `LiveInspectionPage`, hoàn thiện UI chi tiết cho 5 trang placeholder, tích hợp PostgreSQL / YOLO / Qwen-VL |
+| 04/11/2026 | Hoàn thiện thẻ `[Desktop] (8) 3.2.4.2 – Design Login/Criteria/QR Screens and VLM JSON Schema` | Xây dựng `CatalogPage` + `catalog_validation.py` (Goods Category & Criteria Editor, nối `MainWindow`); định nghĩa hợp đồng `vlm_models.py` + `docs/api/vlm_analysis.schema.json` (JSON Schema 1.0); tạo `VlmResultPanel` (defects, label OCR + đối chiếu đơn, uncertainty, 5 mã lỗi & loading/cancel) tích hợp vào `LiveInspectionPage` & `RecordDetailWidget`; xuất `docs/ui-spec/3.2.4.2-ui-spec.md`; sửa lỗi ẩn `error_label` sớm trong `LoginDialog` | Chạy pass 10/10 unit test trong `tests/test_sprint2_checklist.py` trên `QT_QPA_PLATFORM=offscreen` (04/11/2026) | Hoàn thiện 4 trang placeholder còn lại (`USERS`, `DATA_IMPORT`, `INSPECTION_HISTORY`, `REPORTS`), nối PostgreSQL & HTTP client Qwen-VL thật |
 
 ## Rủi ro và vấn đề tồn đọng
 

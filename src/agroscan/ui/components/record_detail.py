@@ -10,6 +10,7 @@ from agroscan.ui.components.data_table import DataTable
 from agroscan.ui.components.evidence_strip import EvidenceStrip
 from agroscan.ui.components.page_layout import KeyValueGrid, SectionCard, make_hint
 from agroscan.ui.components.status_badge import StatusBadge
+from agroscan.ui.components.vlm_result_panel import VlmResultPanel
 from agroscan.ui.formatting import fmt_datetime, fmt_percent
 
 
@@ -57,10 +58,8 @@ class RecordDetailWidget(QWidget):
 
         # Deep analysis
         self.deep_card = SectionCard("Deep Analysis (Qwen-VL)")
-        self.deep_label = QLabel("")
-        self.deep_label.setObjectName("ValueLabel")
-        self.deep_label.setWordWrap(True)
-        self.deep_card.body.addWidget(self.deep_label)
+        self.vlm_panel = VlmResultPanel()
+        self.deep_card.body.addWidget(self.vlm_panel)
         layout.addWidget(self.deep_card)
 
         # Evidence
@@ -121,8 +120,12 @@ class RecordDetailWidget(QWidget):
             ])
         self.detection_table.set_rows(rows)
 
-        self.deep_card.setVisible(bool(record.deep_analysis))
-        self.deep_label.setText(record.deep_analysis)
+        self.deep_card.setVisible(record.deep_analysis is not None)
+        if record.deep_analysis is not None:
+            self.vlm_panel.set_analysis(record.deep_analysis, {
+                "box_code": session.box_code.text,
+                "supplier": session.order.supplier,
+            })
         self.evidence_strip.set_evidence(record.evidence, images)
 
         self.review_card.setVisible(record.review is not None)

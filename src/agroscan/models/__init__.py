@@ -15,6 +15,13 @@ from agroscan.models.inspection_models import (
     SessionStatus,
 )
 from agroscan.models.user_models import Role, User
+from agroscan.models.vlm_models import (
+    VlmAnalysis,
+    VlmErrorCode,
+    VlmSchemaError,
+    VlmStatus,
+    parse_vlm_response,
+)
 
 __all__ = [
     "AiRecommendation",
@@ -33,4 +40,9 @@ __all__ = [
     "Role",
     "SessionStatus",
     "User",
+    "VlmAnalysis",
+    "VlmErrorCode",
+    "VlmSchemaError",
+    "VlmStatus",
+    "parse_vlm_response",
 ]

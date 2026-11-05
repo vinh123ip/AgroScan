@@ -44,6 +44,7 @@ from agroscan.ui.navigation import (
 )
 from agroscan.ui.pages.assessment_result_page import AssessmentResultPage
 from agroscan.ui.pages.box_intake_page import BoxIntakePage
+from agroscan.ui.pages.catalog_page import CatalogPage
 from agroscan.ui.pages.dashboard_page import DashboardPage
 from agroscan.ui.pages.live_inspection_page import LiveInspectionPage
 from agroscan.ui.pages.placeholder_page import PlaceholderPage
@@ -74,13 +75,6 @@ _PLACEHOLDERS: dict[PageKey, tuple[str, list[str]]] = {
             "Excel (.xlsx) and CSV import with downloadable templates",
             "Row-level validation report prior to database commit",
             "PDF data extraction via the Qwen-VL service",
-        ],
-    ),
-    PageKey.CATALOG: (
-        "Manage products, specialized YOLO models, and defect criteria.",
-        [
-            "Product catalog mapped to dedicated YOLO model files",
-            "Configurable defect thresholds and critical defect classes per product",
         ],
     ),
     PageKey.USERS: (
@@ -306,6 +300,8 @@ class MainWindow(QMainWindow):
             return AssessmentResultPage()
         if key == PageKey.REVIEW_QUEUE:
             return ReviewQueuePage(self._repo, self._user)
+        if key == PageKey.CATALOG:
+            return CatalogPage(self._repo)
         if key == PageKey.SETTINGS:
             return SettingsPage(self._settings)
         description, planned = _PLACEHOLDERS.get(key, ("This module is not built yet.", []))
@@ -328,6 +324,10 @@ class MainWindow(QMainWindow):
     @property
     def review_queue_page(self) -> Optional[ReviewQueuePage]:
         return self._pages.get(PageKey.REVIEW_QUEUE)  # type: ignore[return-value]
+
+    @property
+    def catalog_page(self) -> Optional[CatalogPage]:
+        return self._pages.get(PageKey.CATALOG)  # type: ignore[return-value]
 
     # ------------------------------------------------------------------
     # Signals
