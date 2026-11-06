@@ -843,6 +843,38 @@ QCheckBox {
     color: #1D4ED8;
 }
 
+#SessionBadge {
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.4px;
+    border-radius: 6px;
+    padding: 5px 10px;
+}
+#SessionBadge[state="active"] {
+    color: #15803D;
+    background-color: #DCFCE7;
+    border: 1px solid #86EFAC;
+}
+#SessionBadge[state="expired"] {
+    color: #B91C1C;
+    background-color: #FEE2E2;
+    border: 1px solid #FCA5A5;
+}
+
+#QrPreviewFrame {
+    background-color: #FFFFFF;
+    border: 1px solid #CBD5E1;
+    border-radius: 12px;
+}
+
+#QrPayloadLabel {
+    font-family: "Consolas", "Courier New", monospace;
+    font-size: 15px;
+    font-weight: 700;
+    color: #0F172A;
+    padding: 4px 10px;
+}
+
 /* ====================================================
    SCROLLBARS
    ==================================================== */

@@ -14,7 +14,7 @@ from agroscan.models.inspection_models import (
     ReviewRecord,
     SessionStatus,
 )
-from agroscan.models.user_models import Role, User
+from agroscan.models.user_models import AuthSession, Role, User
 from agroscan.models.vlm_models import (
     VlmAnalysis,
     VlmErrorCode,
@@ -25,6 +25,7 @@ from agroscan.models.vlm_models import (
 
 __all__ = [
     "AiRecommendation",
+    "AuthSession",
     "BoxCode",
     "DefectCriterion",
     "DetectionResult",

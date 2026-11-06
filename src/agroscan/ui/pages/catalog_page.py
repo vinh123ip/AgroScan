@@ -11,7 +11,7 @@ editor configures thresholds; it does not change how they are evaluated.
 
 from typing import Optional
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -65,6 +65,8 @@ def describe_rules(product: Product) -> list[str]:
 class CatalogPage(QWidget):
     """Goods Category & Criteria Editor."""
 
+    catalog_changed = Signal()
+
     _COL_CLASS, _COL_RATIO, _COL_CRITICAL = range(3)
 
     def __init__(self, repo: MockRepository, parent: Optional[QWidget] = None) -> None:
@@ -114,6 +116,12 @@ class CatalogPage(QWidget):
         filter_row.addWidget(filter_label)
         filter_row.addWidget(self.category_filter, 1)
         layout.addLayout(filter_row)
+
+        self.search_field = QLineEdit()
+        self.search_field.setObjectName("FormField")
+        self.search_field.setPlaceholderText("Search by code, product name, or YOLO model…")
+        self.search_field.setClearButtonEnabled(True)
+        layout.addWidget(self.search_field)
 
         self.count_label = QLabel("")
         self.count_label.setObjectName("FormSectionTitle")
@@ -226,6 +234,11 @@ class CatalogPage(QWidget):
             crit_buttons.addWidget(btn)
         crit_buttons.addStretch()
         criteria.body.addLayout(crit_buttons)
+        self.conflict_label = QLabel("")
+        self.conflict_label.setObjectName("WarningNote")
+        self.conflict_label.setWordWrap(True)
+        self.conflict_label.setVisible(False)
+        criteria.body.addWidget(self.conflict_label)
         criteria.body.addWidget(make_hint(
             "Max ratio: the box is proposed as Fail when that defect's share of detected "
             "objects exceeds the limit. Critical: any occurrence proposes Fail immediately "
@@ -281,6 +294,7 @@ class CatalogPage(QWidget):
 
     def _connect_signals(self) -> None:
         self.category_filter.currentIndexChanged.connect(lambda _: self._fill_table())
+        self.search_field.textChanged.connect(lambda _: self._fill_table())
         self.product_table.itemSelectionChanged.connect(self._on_selection_changed)
         self.btn_new.clicked.connect(self._on_new)
         self.btn_delete.clicked.connect(self._on_delete)
@@ -303,6 +317,10 @@ class CatalogPage(QWidget):
     @property
     def is_dirty(self) -> bool:
         return self._baseline is not None and self.form_product() != self._baseline
+
+    def confirm_discard_changes(self) -> bool:
+        """Ask the user before leaving the page when unsaved edits exist."""
+        return self._confirm_discard()
 
     def refresh(self, select_code: Optional[str] = None) -> None:
         """Reload categories and products; keep or set the selected product."""
@@ -346,9 +364,21 @@ class CatalogPage(QWidget):
 
     def _visible_products(self) -> list[Product]:
         category = self.category_filter.currentText()
-        if not category or category == _ALL_CATEGORIES:
-            return list(self._repo.products)
-        return [p for p in self._repo.products if p.category == category]
+        items = (
+            list(self._repo.products)
+            if not category or category == _ALL_CATEGORIES
+            else [p for p in self._repo.products if p.category == category]
+        )
+        needle = self.search_field.text().strip().lower()
+        if not needle:
+            return items
+        return [
+            p for p in items
+            if needle in p.code.lower()
+            or needle in p.name.lower()
+            or needle in p.category.lower()
+            or needle in p.model_file.lower()
+        ]
 
     def _fill_table(self, select_code: Optional[str] = None) -> None:
         products = self._visible_products()
@@ -538,6 +568,18 @@ class CatalogPage(QWidget):
             return
         product = self.form_product()
         self.preview_label.setText("\n".join(f"•  {line}" for line in describe_rules(product)))
+        seen_classes: list[str] = []
+        duplicates: list[str] = []
+        for criterion in product.criteria:
+            if criterion.defect_class in seen_classes and criterion.defect_class not in duplicates:
+                duplicates.append(criterion.defect_class)
+            seen_classes.append(criterion.defect_class)
+        self.conflict_label.setVisible(bool(duplicates))
+        if duplicates:
+            self.conflict_label.setText(
+                f"▲  Duplicate criterion row(s) for {', '.join(repr(d) for d in duplicates)}. "
+                "Each defect class must have at most one threshold."
+            )
         dirty = self.is_dirty
         self.btn_save.setEnabled(dirty or self._original is None)
         self.btn_revert.setEnabled(dirty)
@@ -587,6 +629,7 @@ class CatalogPage(QWidget):
         self.refresh(select_code=saved.code)
         self._load_product(saved)
         self.status_label.setText(f"✔  {saved.name} saved.")
+        self.catalog_changed.emit()
 
     def _on_delete(self) -> None:
         if self._original is None:
@@ -606,6 +649,7 @@ class CatalogPage(QWidget):
         self._original, self._baseline = None, None
         self.refresh()
         self.status_label.setText(f"✔  {product.name} deleted.")
+        self.catalog_changed.emit()
 
     def showEvent(self, event) -> None:  # noqa: N802 — Qt override
         super().showEvent(event)

@@ -708,6 +708,38 @@ QCheckBox      { font-size: 13px; font-weight: 600; color: #E2E8F0; spacing: 8px
     color: #7DD3FC;
 }
 
+#SessionBadge {
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.4px;
+    border-radius: 6px;
+    padding: 5px 10px;
+}
+#SessionBadge[state="active"] {
+    color: #4ADE80;
+    background-color: rgba(74, 222, 128, 0.14);
+    border: 1px solid rgba(74, 222, 128, 0.40);
+}
+#SessionBadge[state="expired"] {
+    color: #F87171;
+    background-color: rgba(248, 113, 113, 0.14);
+    border: 1px solid rgba(248, 113, 113, 0.45);
+}
+
+#QrPreviewFrame {
+    background-color: #1E293B;
+    border: 1px solid #334155;
+    border-radius: 12px;
+}
+
+#QrPayloadLabel {
+    font-family: "Consolas", "Courier New", monospace;
+    font-size: 15px;
+    font-weight: 700;
+    color: #F8FAFC;
+    padding: 4px 10px;
+}
+
 /* Scrollbars */
 QScrollBar:vertical {
     background: transparent;

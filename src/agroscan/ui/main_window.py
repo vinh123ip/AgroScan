@@ -5,6 +5,7 @@ page is instantiated only when the signed-in role has permission to access it
 (D-032), ensuring restricted pages do not exist in memory for unauthorized roles.
 """
 
+from datetime import datetime
 from typing import Callable, Optional
 
 from PySide6.QtCore import QEasingCurve, QPropertyAnimation, QSize, Qt, QTimer, Signal
@@ -29,7 +30,7 @@ from agroscan.models.inspection_models import (
     InspectionSession,
     Order,
 )
-from agroscan.models.user_models import User
+from agroscan.models.user_models import AuthSession, User
 from agroscan.services.app_settings import AppSettings
 from agroscan.services.mock_auth import MockAuthService
 from agroscan.services.mock_repository import MockRepository
@@ -43,7 +44,7 @@ from agroscan.ui.navigation import (
     sidebar_specs,
 )
 from agroscan.ui.pages.assessment_result_page import AssessmentResultPage
-from agroscan.ui.pages.box_intake_page import BoxIntakePage
+from agroscan.ui.pages.box_intake_page import BoxIntakePage, classify_intake_error
 from agroscan.ui.pages.catalog_page import CatalogPage
 from agroscan.ui.pages.dashboard_page import DashboardPage
 from agroscan.ui.pages.live_inspection_page import LiveInspectionPage
@@ -91,10 +92,12 @@ class MainWindow(QMainWindow):
     """Primary workstation window displayed after authentication."""
 
     logout_requested = Signal()
+    session_expired  = Signal(str)
 
     _NOTICE_MS = 4500
     _LOADING_TRANSITION_MS = 280
     _LOADING_ESTIMATE_MS = 2000
+    _SESSION_CHECK_MS = 30_000
 
     def __init__(
         self,
@@ -102,6 +105,7 @@ class MainWindow(QMainWindow):
         auth_service: MockAuthService,
         repo: MockRepository,
         settings: Optional[AppSettings] = None,
+        auth_session: Optional[AuthSession] = None,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
@@ -109,6 +113,17 @@ class MainWindow(QMainWindow):
         self._auth = auth_service
         self._repo = repo
         self._settings = settings or AppSettings()
+        if auth_session is not None:
+            self._auth_session = auth_session
+        elif (
+            self._auth.current_session is not None
+            and self._auth.current_session.user.username == user.username
+        ):
+            self._auth_session = self._auth.current_session
+        else:
+            self._auth_session = self._auth.issue_session(
+                user, station_name=self._settings.load().station_name
+            )
 
         self.setWindowTitle(f"AgroScan — {user.display_name} ({user.role.value})")
         self.resize(1440, 900)
@@ -123,9 +138,12 @@ class MainWindow(QMainWindow):
 
         self._notice_timer = QTimer(self)
         self._notice_timer.setSingleShot(True)
+        self._session_timer = QTimer(self)
+        self._session_timer.setInterval(self._SESSION_CHECK_MS)
 
         self._init_ui()
         self._connect_signals()
+        self._session_timer.start()
         self.navigate_to(PageKey.DASHBOARD)
 
     # ------------------------------------------------------------------
@@ -135,6 +153,10 @@ class MainWindow(QMainWindow):
     @property
     def user(self) -> User:
         return self._user
+
+    @property
+    def auth_session(self) -> AuthSession:
+        return self._auth_session
 
     @property
     def current_page(self) -> Optional[PageKey]:
@@ -148,6 +170,17 @@ class MainWindow(QMainWindow):
         """Switch to ``key`` if permitted for the signed-in role."""
         if key not in self._pages:
             return False
+
+        if (
+            self._current_key == PageKey.CATALOG
+            and key != PageKey.CATALOG
+            and self.catalog_page is not None
+            and self.catalog_page.is_dirty
+        ):
+            if not self.catalog_page.confirm_discard_changes():
+                self._sync_sidebar(PageKey.CATALOG)
+                return False
+            self.catalog_page._on_revert()
 
         if self._is_loading:
             if key == self._pending_key:
@@ -257,10 +290,22 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.notice_label, alignment=Qt.AlignmentFlag.AlignVCenter)
         layout.addSpacing(8)
 
+        self.session_badge = QLabel("●  SESSION ACTIVE")
+        self.session_badge.setObjectName("SessionBadge")
+        self.session_badge.setProperty("state", "active")
+        self.session_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        session_tip = (
+            f"Session ID: {self._auth_session.session_id}\n"
+            f"Station: {self._auth_session.station_name}\n"
+            f"Token: {self._auth_session.masked_token}\n"
+            f"Expires: {self._auth_session.expires_at:%Y-%m-%d %H:%M:%S}"
+        )
+        self.session_badge.setToolTip(session_tip)
+
         self.user_label = QLabel(self._user.display_name)
         self.user_label.setObjectName("UserLabel")
         self.user_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.user_label.setToolTip(f"Signed in as {self._user.username}")
+        self.user_label.setToolTip(f"Signed in as {self._user.username}\n{session_tip}")
 
         self.role_badge = QLabel(self._user.role.value.upper())
         self.role_badge.setObjectName("RoleBadge")
@@ -272,7 +317,7 @@ class MainWindow(QMainWindow):
         self.btn_logout.setFixedHeight(36)
         self.btn_logout.setCursor(Qt.CursorShape.PointingHandCursor)
 
-        for widget in (self.user_label, self.role_badge, self.btn_logout):
+        for widget in (self.session_badge, self.user_label, self.role_badge, self.btn_logout):
             layout.addWidget(widget, alignment=Qt.AlignmentFlag.AlignVCenter)
         return header
 
@@ -337,12 +382,17 @@ class MainWindow(QMainWindow):
         self.navigation.itemClicked.connect(self._on_nav_item_clicked)
         self.btn_logout.clicked.connect(self._on_logout_clicked)
         self._notice_timer.timeout.connect(lambda: self.notice_label.setVisible(False))
+        self._session_timer.timeout.connect(lambda: self.verify_auth_session())
 
         review_queue = self.review_queue_page
         if review_queue is not None:
             review_queue.review_submitted.connect(self._on_review_submitted)
 
+        catalog = self.catalog_page
         intake = self.box_intake_page
+        if catalog is not None and intake is not None:
+            catalog.catalog_changed.connect(intake.refresh_catalog_data)
+
         live = self.live_inspection_page
         result = self.assessment_result_page
         if intake is None or live is None or result is None:
@@ -386,7 +436,8 @@ class MainWindow(QMainWindow):
         try:
             box_code, order = self._repo.resolve_box(text)
         except ValueError as exc:
-            on_error(str(exc))
+            _, message = classify_intake_error(text, str(exc))
+            on_error(message)
             return
         if self._release_active_session(box_code, on_error):
             self._open_session(box_code, order, "")
@@ -549,7 +600,27 @@ class MainWindow(QMainWindow):
     # Logout & shutdown
     # ------------------------------------------------------------------
 
+    def verify_auth_session(self, now: Optional[datetime] = None) -> bool:
+        """Check whether the bearer session token is still valid; force re-login if expired."""
+        valid = self._auth.validate_token(self._auth_session.token, now=now)
+        if valid is not None:
+            return True
+        self.session_badge.setText("✖  SESSION EXPIRED")
+        self.session_badge.setProperty("state", "expired")
+        self.session_badge.style().unpolish(self.session_badge)
+        self.session_badge.style().polish(self.session_badge)
+        self.shutdown()
+        self._auth.logout(self._auth_session.token)
+        self._settings.clear_session_state()
+        message = "Session expired or revoked. Please sign in again."
+        self.session_expired.emit(message)
+        self.logout_requested.emit()
+        return False
+
     def _confirm_discard_active_session(self, action: str) -> bool:
+        if self.catalog_page is not None and self.catalog_page.is_dirty:
+            if not self.catalog_page.confirm_discard_changes():
+                return False
         session = self._active_session()
         if session is None:
             return True
@@ -564,6 +635,7 @@ class MainWindow(QMainWindow):
         """Release camera, loading animation, and active timers prior to teardown."""
         self.loading_screen.stop()
         self._notice_timer.stop()
+        self._session_timer.stop()
         if self.live_inspection_page is not None:
             self.live_inspection_page.clear_session()
 
@@ -571,6 +643,8 @@ class MainWindow(QMainWindow):
         if not self._confirm_discard_active_session("Log Out"):
             return
         self.shutdown()
+        self._auth.logout(self._auth_session.token)
+        self._settings.clear_session_state()
         self.logout_requested.emit()
 
     def closeEvent(self, event) -> None:  # noqa: N802 — Qt override
