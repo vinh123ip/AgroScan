@@ -1,0 +1,4 @@
+order_code,product_code,supplier,total_boxes,expected_quantity
+DH00200,BANANA,Green Valley Farm,10,240
+DH00201,APPLE,Da Lat Orchard Co.,6,150
+DH00202,MANGO,Cam Ranh Mango Coop,8,180

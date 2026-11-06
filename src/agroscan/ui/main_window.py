@@ -46,6 +46,7 @@ from agroscan.ui.pages.assessment_result_page import AssessmentResultPage
 from agroscan.ui.pages.box_intake_page import BoxIntakePage
 from agroscan.ui.pages.catalog_page import CatalogPage
 from agroscan.ui.pages.dashboard_page import DashboardPage
+from agroscan.ui.pages.data_import_page import DataImportPage
 from agroscan.ui.pages.live_inspection_page import LiveInspectionPage
 from agroscan.ui.pages.placeholder_page import PlaceholderPage
 from agroscan.ui.pages.review_queue_page import ReviewQueuePage
@@ -67,14 +68,6 @@ _PLACEHOLDERS: dict[PageKey, tuple[str, list[str]]] = {
             "Order-level aggregation, e.g. \"8/10 boxes passed, 1 pending, 1 failed\"",
             "Daily outcome charts and quality ratios",
             "PDF and Excel export using unified filter criteria",
-        ],
-    ),
-    PageKey.DATA_IMPORT: (
-        "Import orders, products, inspection criteria, and users.",
-        [
-            "Excel (.xlsx) and CSV import with downloadable templates",
-            "Row-level validation report prior to database commit",
-            "PDF data extraction via the Qwen-VL service",
         ],
     ),
     PageKey.USERS: (
@@ -302,6 +295,9 @@ class MainWindow(QMainWindow):
             return ReviewQueuePage(self._repo, self._user)
         if key == PageKey.CATALOG:
             return CatalogPage(self._repo)
+        if key == PageKey.DATA_IMPORT:
+            # No Order Import / List Orders API yet (task 3.1.5.7, option C): no gateway.
+            return DataImportPage(self._repo, gateway=None)
         if key == PageKey.SETTINGS:
             return SettingsPage(self._settings)
         description, planned = _PLACEHOLDERS.get(key, ("This module is not built yet.", []))
@@ -328,6 +324,10 @@ class MainWindow(QMainWindow):
     @property
     def catalog_page(self) -> Optional[CatalogPage]:
         return self._pages.get(PageKey.CATALOG)  # type: ignore[return-value]
+
+    @property
+    def data_import_page(self) -> Optional[DataImportPage]:
+        return self._pages.get(PageKey.DATA_IMPORT)  # type: ignore[return-value]
 
     # ------------------------------------------------------------------
     # Signals

@@ -4,7 +4,7 @@
 
 AI cập nhật tệp này sau mỗi nhiệm vụ thuộc roadmap và ghi rõ phần nào chưa kiểm chứng.
 
-**Cập nhật lần cuối:** 04/11/2026
+**Cập nhật lần cuối:** 06/11/2026
 
 ## Trạng thái
 
@@ -19,7 +19,7 @@ Trạng thái ban đầu là **chưa xác minh**. Ở phiên đầu tiên, AI kh
 
 | # | Hạng mục (theo sơ đồ) | Trạng thái | Bằng chứng (tệp/hàm/test/ngày) | Ghi chú |
 |---|---|---|---|---|
-| 1 | Chuẩn bị và nhập dữ liệu ban đầu (Excel/CSV chính, PDF giao Qwen-VL) | ⬜ | | D-029 |
+| 1 | Chuẩn bị và nhập dữ liệu ban đầu (Excel/CSV chính, PDF giao Qwen-VL) | 🟡 | order_import.py, order_gateway.py, import_preview_model.py, data_import_page.py, docs/templates/orders_template.csv, 	ests/test_order_import.py (06/11/2026) | D-029; đã xong UI + đọc/validate .xlsx/.csv (phương án C); chờ nối Order Import / List Orders API hoặc PostgreSQL |
 | 2 | Quản lý danh mục, tiêu chí kiểm định, người dùng/phân quyền, cấu hình hệ thống | ⬜ | | D-024 (model theo quả), D-027 (3 vai trò), D-028 (Settings) |
 | 3 | Tiếp nhận đơn hàng (quét barcode QR, 1 mã = 1 hộp = 1 phiên) | ⬜ | | D-019, D-020, D-021. Phiên AI khác báo mới có form nhập tay, dữ liệu chỉ trong RAM (chưa kiểm chứng) |
 | 4 | Kiểm tra realtime: camera + YOLO chuyên hóa + ByteTrack + ảnh tĩnh bằng chứng | ⬜ | | D-024, D-025, D-026. Cần tìm dataset, train model, đo hiệu năng trên GTX 1650 Ti |
@@ -54,6 +54,7 @@ Việc AI cần làm ở phiên đầu (chỉ đọc, **không sửa tệp**):
 | 01/11/2026 | Chốt D-030 (trạng thái), D-031 (camera-first + sim feed), D-032 (dynamic RBAC); phát hiện mã nguồn đang dở dang giữa Bước 2 và 3 | Ghi nhận D-030→D-032; đã tạo các module trang mới và services | `python run.py` văng `ImportError: CommodityType` do `main_window.py` chưa nối `navigation.py` | Ráp nối `main_window.py` & `main.py` với `navigation.py`, hoàn thiện UI shell |
 | 01/11/2026 | Ráp nối `main_window.py`, `main.py`, `placeholder_page.py`, `dark_theme.qss`; gỡ xung đột `new_inspection_page.py` | Khởi chạy hoàn chỉnh luồng `LoginDialog` ↔ `MainWindow` theo `PageKey` và phân quyền động D-032 (3 vai trò), nối luồng `BoxIntake` → `LiveInspection` → `AssessmentResult` → `ReviewQueue` (mock RAM) | Chạy pass toàn bộ smoke test & vòng lặp `run.py` trên `QT_QPA_PLATFORM=offscreen` (01/11/2026) | Bổ sung toggle simulation feed D-031 trong `LiveInspectionPage`, hoàn thiện UI chi tiết cho 5 trang placeholder, tích hợp PostgreSQL / YOLO / Qwen-VL |
 | 04/11/2026 | Hoàn thiện thẻ `[Desktop] (8) 3.2.4.2 – Design Login/Criteria/QR Screens and VLM JSON Schema` | Xây dựng `CatalogPage` + `catalog_validation.py` (Goods Category & Criteria Editor, nối `MainWindow`); định nghĩa hợp đồng `vlm_models.py` + `docs/api/vlm_analysis.schema.json` (JSON Schema 1.0); tạo `VlmResultPanel` (defects, label OCR + đối chiếu đơn, uncertainty, 5 mã lỗi & loading/cancel) tích hợp vào `LiveInspectionPage` & `RecordDetailWidget`; xuất `docs/ui-spec/3.2.4.2-ui-spec.md`; sửa lỗi ẩn `error_label` sớm trong `LoginDialog` | Chạy pass 10/10 unit test trong `tests/test_sprint2_checklist.py` trên `QT_QPA_PLATFORM=offscreen` (04/11/2026) | Hoàn thiện 4 trang placeholder còn lại (`USERS`, `DATA_IMPORT`, `INSPECTION_HISTORY`, `REPORTS`), nối PostgreSQL & HTTP client Qwen-VL thật |
+| 06/11/2026 | Triển khai thẻ `[Desktop] (6) 3.1.5.7 – Build Order Import UI and Database Preview Connection` theo phương án C (UI + kiểm tra dữ liệu) | Xây dựng `order_import.py` (đọc .xlsx/.csv bằng stdlib, validate cấu trúc & từng dòng), `order_gateway.py` (protocol `OrderGateway`), `import_preview_model.py` (`QAbstractTableModel` tô màu dòng/ô lỗi), `data_import_page.py` (nối `MainWindow`, chạy nền `QRunnable`), mẫu `docs/templates/orders_template.csv`, QSS cho light/dark theme | Chạy pass 4/4 unit test parser/validation trong `tests/test_order_import.py` & `compileall` toàn repo (Python 3.12.13, 06/11/2026); 2 test UI Qt tự skip do môi trường máy chưa cài `PySide6` | Cài `.venv` + `PySide6` để chạy 2 test UI Qt; nối Order Import / List Orders API (3.1.5.2/3.1.5.6) hoặc PostgreSQL DAL |
 
 ## Rủi ro và vấn đề tồn đọng
 

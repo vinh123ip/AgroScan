@@ -745,3 +745,59 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
     background: none;
     width: 0;
 }
+
+
+/* ====================================================
+   DATA IMPORT PAGE (3.1.5.7)
+   ==================================================== */
+
+#DataImportPage {
+    background-color: #0F172A;
+}
+
+#ImportMetricCard {
+    background-color: #1E293B;
+    border: 1px solid #334155;
+    border-radius: 12px;
+}
+
+#ImportMetricTitle {
+    font-size: 11px;
+    font-weight: 700;
+    color: #94A3B8;
+    letter-spacing: 1px;
+}
+
+#ImportMetricValue {
+    font-size: 28px;
+    font-weight: 800;
+    color: #F8FAFC;
+}
+
+#ImportMetricValue[tone="good"] {
+    color: #4ADE80;
+}
+
+#ImportMetricValue[tone="critical"] {
+    color: #F87171;
+}
+
+#ImportSuccessLabel {
+    font-size: 14px;
+    font-weight: 600;
+    color: #4ADE80;
+    background-color: rgba(74, 222, 128, 0.12);
+    border: 1px solid rgba(74, 222, 128, 0.35);
+    border-radius: 8px;
+    padding: 10px 16px;
+}
+
+#ImportEmptyState {
+    font-size: 14px;
+    font-weight: 500;
+    color: #94A3B8;
+    background-color: #0F172A;
+    border: 1px dashed #334155;
+    border-radius: 10px;
+    padding: 20px;
+}
