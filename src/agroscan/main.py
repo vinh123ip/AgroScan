@@ -4,11 +4,12 @@ import sys
 from typing import Optional
 
 from PySide6.QtCore import QObject, QTimer
-from PySide6.QtWidgets import QApplication, QDialog
+from PySide6.QtWidgets import QApplication, QDialog, QMessageBox
 
 from agroscan.services.app_settings import AppSettings
 from agroscan.services.mock_auth import MockAuthService
 from agroscan.services.mock_repository import MockRepository
+from agroscan.services.postgres_repository import PostgresRepository
 from agroscan.ui.main_window import MainWindow
 from agroscan.ui.pages.login_dialog import LoginDialog
 from agroscan.ui.theme import apply_theme
@@ -82,12 +83,31 @@ class AppController(QObject):
             QApplication.quit()
 
 
+def create_repository(settings: AppSettings, warn_on_fallback: bool = True) -> PostgresRepository | MockRepository:
+    """Connect to PostgreSQL if reachable, otherwise fall back to ``MockRepository``."""
+    pg_repo = PostgresRepository(settings)
+    ok, message = pg_repo.ping()
+    if ok:
+        return pg_repo
+    if warn_on_fallback:
+        QMessageBox.warning(
+            None,
+            "Database Offline — Demo Fallback",
+            f"Could not connect to PostgreSQL ({message}).\n\n"
+            "AgroScan will run in temporary RAM mode (MockRepository) so data will not "
+            "be saved after closing. Verify PostgreSQL service and .env credentials.",
+        )
+    return MockRepository()
+
+
 def main() -> None:
     app = QApplication(sys.argv)
     app.setApplicationName("AgroScan")
     apply_theme(app)
 
-    controller = AppController(AppSettings(), MockAuthService(), MockRepository())
+    settings = AppSettings()
+    repo = create_repository(settings)
+    controller = AppController(settings, MockAuthService(), repo)
     if not controller.show_login():
         sys.exit(0)
     sys.exit(app.exec())
