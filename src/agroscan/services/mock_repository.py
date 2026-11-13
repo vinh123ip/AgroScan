@@ -28,7 +28,7 @@ from agroscan.models.inspection_models import (
     SessionStatus,
 )
 from agroscan.models.user_models import Role, User
-from agroscan.services import mock_ai
+from agroscan.services import mock_ai, rule_engine
 from agroscan.services.catalog_validation import validate_product
 from agroscan.services.mock_auth import MockAuthService
 
@@ -280,7 +280,7 @@ class MockRepository:
         session.started_at = started
 
         detection = mock_ai.simulate_detection(order.product, self._rng)
-        assessment = mock_ai.assess_quality(order.product, detection)
+        assessment = rule_engine.assess_quality(order.product, detection)
         deep_analysis = (
             mock_ai.simulate_deep_analysis(session, detection, rng=self._rng)
             if assessment.recommendation != AiRecommendation.PASS or not review
