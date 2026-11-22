@@ -1,0 +1,135 @@
+================================================================================
+DỰ ÁN AGROSCAN - BỘ PROMPT CHỮ CHUẨN ĐỂ MANG RA APP NGOÀI VẼ SƠ ĐỒ
+Tệp được lưu trực tiếp trên máy tính tại:
+D:\Github Clone\AgroScan\SO_DO_ROLE_VA_UI_FLOW.txt
+================================================================================
+
+Để đảm bảo các app vẽ hoặc AI ngoài (ChatGPT, Claude, Eraser.io, Whimsical, Napkin...)
+KHÔNG BỊ THIẾU BẤT KỲ NHÁNH NGHIỆP VỤ NÀO, bộ prompt được tách thành 2 PROMPT ĐỘC LẬP:
+
+- PROMPT 1: Chuyên vẽ Sơ đồ Cấu trúc Phân quyền & Vai trò (Role & RBAC Diagram)
+- PROMPT 2: Chuyên vẽ Sơ đồ Luồng Nghiệp vụ & Giao diện Chi tiết (Business & UI Flow)
+- PROMPT 3: Prompt gộp cả hai (Nếu bạn muốn vẽ chung trên 1 bức tranh lớn)
+
+Bạn chỉ cần sao chép nội dung trong từng phần tương ứng mang ra ngoài.
+
+================================================================================
+PHẦN 1: PROMPT VẼ SƠ ĐỒ PHÂN QUYỀN (ROLE & DYNAMIC RBAC ARCHITECTURE)
+================================================================================
+(Copy toàn bộ đoạn văn bản trong dấu ngoặc kép dưới đây):
+
+"Hãy vẽ cho tôi một sơ đồ kiến trúc phân quyền người dùng (Role-Based Access Control - RBAC Diagram) cực kỳ chi tiết cho hệ thống máy trạm kiểm định chất lượng AgroScan.
+
+YÊU CẦU NỘI DUNG SƠ ĐỒ PHÂN QUYỀN:
+
+1. BA VAI TRÒ HỆ THỐNG (3 ACTORS / ROLES):
+- ADMIN (Quản trị viên hệ thống): Toàn quyền quản trị và vận hành.
+- INSPECTOR (Nhân viên trạm kiểm định): Thao tác trực tiếp tại trạm với camera và máy quét mã vạch.
+- REVIEWER (Chuyên viên thẩm định chất lượng): Làm việc qua mạng nội bộ LAN để thẩm định và ký duyệt lô hàng.
+
+2. CƠ CHẾ BẢO MẬT PHIÊN VÀ PHÂN QUYỀN ĐỘNG (SECURITY & DYNAMIC RBAC):
+- Đăng nhập cấp phát AuthSession mang Bearer Token được ký số HMAC-SHA256, thời hạn 8 tiếng (hết ca làm việc).
+- Sidebar lọc động (Dynamic Sidebar): Các trang không có quyền sẽ BỊ ẨN HOÀN TOÀN khỏi thanh điều hướng (không hiển thị dạng mờ).
+- Cô lập bộ nhớ (Memory Isolation): Trang bị cấm sẽ không được khởi tạo vào RAM của máy trạm.
+
+3. MA TRẬN PHÂN QUYỀN THEO TRANG VÀ CHỨC NĂNG (RBAC PERMISSION MATRIX):
+
+Nhóm 1 - Khối Vận hành (OPERATIONS):
+- Dashboard (Tổng quan KPI): Cả 3 Role (Admin, Inspector, Reviewer) đều xem được.
+- Box Intake (Tiếp nhận & Quét mã QR hộp): Chỉ Admin và Inspector có quyền. Reviewer bị ẩn.
+- Live Inspection (Camera preview, AI YOLO realtime, Qwen-VL, chụp ảnh bằng chứng): Chỉ Admin và Inspector có quyền. Reviewer bị ẩn.
+- Assessment Result (Xem đề xuất của Python Rule Engine, submit gửi duyệt): Chỉ Admin và Inspector có quyền.
+- Review Queue (Hàng đợi thẩm định: Xem ảnh bằng chứng và ra quyết định Pass/Fail/Re-inspect): Chỉ Admin và Reviewer có quyền. Inspector bị ẩn hoàn toàn để đảm bảo tính khách quan (người kiểm tra không tự duyệt hàng).
+
+Nhóm 2 - Khối Hồ sơ & Báo cáo (RECORDS):
+- Inspection History (Tra cứu lịch sử phiên theo mã hộp, mã đơn, ngày tháng): Cả 3 Role đều xem được.
+- Reports (Báo cáo thống kê, tổng hợp cấp đơn hàng '8/10 hộp đạt', xuất file PDF/Excel): Cả 3 Role đều xem được.
+
+Nhóm 3 - Khối Quản trị hệ thống (ADMINISTRATION) - ĐỘC QUYỀN CHO ADMIN:
+- Data Import: Nhập dữ liệu danh sách đơn hàng, nhà cung cấp bằng file Excel/CSV/PDF. (Chỉ Admin)
+- Catalog & Criteria: Quản lý danh mục quả, gán model AI ONNX riêng cho từng quả (banana_defect.onnx), chỉnh sửa ngưỡng tỷ lệ lỗi và cờ lỗi nghiêm trọng. (Chỉ Admin)
+- Users: Quản lý tài khoản, kích hoạt hoặc khóa tài khoản, phân quyền. (Chỉ Admin)
+- Settings: Cấu hình kết nối mạng LAN (IP PostgreSQL, URL AI Qwen-VL, thư mục lưu ảnh SMB, chọn Camera). (Chỉ Admin)
+
+Hãy vẽ sơ đồ cây phân cấp trực quan, thể hiện rõ 3 Role kết nối tới các nhóm chức năng trên, có ghi chú rõ ràng về các trang bị cấm của từng role."
+
+
+================================================================================
+PHẦN 2: PROMPT VẼ SƠ ĐỒ LUỒNG NGHIỆP VỤ & GIAO DIỆN (END-TO-END BUSINESS & UI FLOW)
+================================================================================
+(Copy toàn bộ đoạn văn bản trong dấu ngoặc kép dưới đây):
+
+"Hãy vẽ cho tôi một sơ đồ luồng nghiệp vụ và giao diện (Business & UI Flow Diagram) chi tiết từ đầu đến cuối cho hệ thống kiểm định nông sản thông minh AgroScan.
+
+YÊU CẦU NỘI DUNG SƠ ĐỒ NGHIỆP VỤ VÀ GIAO DIỆN:
+
+GIAI ĐOẠN 1: KHỞI TẠO VÀ XÁC THỰC
+- Điểm bắt đầu: Mở ứng dụng -> Vào màn hình LoginDialog.
+- Nhánh phụ: Nút 'Connection Settings' -> Mở ConnectionSettingsDialog để kỹ thuật viên kiểm tra kết nối mạng LAN (IP PostgreSQL, URL Qwen-VL, thư mục SMB) trước khi đăng nhập.
+- Xác thực: Nhập User/Pass hoặc bấm 3 nút Quick Sign-in (Admin, Inspector, Reviewer).
+  + Nếu sai -> Báo lỗi Inline error.
+  + Nếu đúng -> Cấp Bearer Token HMAC-SHA256 -> Mở MainWindow (Sidebar co giãn theo quyền).
+
+GIAI ĐOẠN 2: TIẾP NHẬN HỘP TẠI TRẠM (INSPECTOR TRÊN BoxIntakePage)
+- Máy quét mã vạch 2D USB (dạng bàn phím HID) quét mã QR trên hộp (Cấu trúc chuẩn: AGS:<MãĐơn>-<SốHộp>/<TổngSố>). Tích hợp debounce 350ms chống nảy cò.
+- Kiểm tra tính hợp lệ của mã:
+  + Nếu quét nhầm mã vạch bán lẻ EAN-13/GTIN -> Báo lỗi ERR_RETAIL_BARCODE.
+  + Nếu thiếu tiền tố AGS: -> Báo lỗi ERR_MISSING_PREFIX.
+  + Nếu số thứ tự hộp vượt quá tổng hộp -> Báo lỗi ERR_BOX_OUT_OF_RANGE.
+  + Nếu mã đơn không tồn tại -> Báo lỗi ERR_ORDER_NOT_FOUND.
+  + Nếu mã hợp lệ -> Hiển thị chi tiết đơn hàng (Order Code, Tên quả, Lot size, Nhà cung cấp, Bảng tiêu chí chất lượng và ngưỡng lỗi cho phép).
+- Bấm nút 'Start Inspection':
+  + Kiểm tra: Nếu hộp này đang có phiên dở dang -> Chặn không cho mở trùng.
+  + Nếu sẵn sàng -> Khởi tạo InspectionSession mới với trạng thái IN_PROGRESS -> Chuyển sang màn hình LiveInspectionPage.
+
+GIAI ĐOẠN 3: KIỂM ĐỊNH TRỰC TIẾP CAMERA & AI (LiveInspectionPage)
+- Camera livestream thời gian thực hiển thị hình ảnh thùng quả.
+- AI YOLO chạy trên máy trạm (Edge): Định vị bounding box, đếm số lượng quả theo loại (Fresh, Bruised, Rotten). Tích hợp làm mượt số liệu (Moving Average) qua 5 khung hình liên tiếp.
+- Bấm nút 'Capture Evidence': Hệ thống chụp ảnh tĩnh độ nét cao -> Tính mã băm SHA-256 bảo vệ tính toàn vẹn -> Đưa thumbnail vào dải ảnh bằng chứng (Evidence Strip).
+- Bấm nút 'Analyze with Qwen-VL' (Tùy chọn): Gọi HTTP REST sang máy chủ LAN (PC RTX 3060) -> Trả về bảng VlmResultPanel gồm:
+  1. Chi tiết vết dập/thối, tọa độ khuyết tật, mức độ nghiêm trọng.
+  2. OCR đọc chữ trên nhãn thùng đối chiếu với mã đơn hàng (báo cờ đỏ nếu giao sai loại quả hoặc sai mã lô).
+  3. Điểm phân vân và giải thích lý do không chắc chắn của AI (Uncertainty rationale).
+- Tính năng Quét liên tục (Continuous Scan): Inspector có thể quét mã hộp tiếp theo ngay tại màn hình này -> Hệ thống tự động chốt ảnh hộp cũ, gửi duyệt và mở phiên mới cho hộp tiếp theo ngay lập tức mà không cần chờ đợi.
+- Bấm nút 'Finish & Review': Kết thúc kiểm tra trực quan.
+
+GIAI ĐOẠN 4: ĐỐI CHIẾU QUY TẮC & ĐỀ XUẤT (AssessmentResultPage)
+- Python Rule Engine (Trọng tài nghiệp vụ): Tính toán số liệu chính thức dựa trên ẢNH TĨNH ĐÃ CHỤP (không dùng số liệu tạm từ video) và đối chiếu với tiêu chí trong DB:
+  + Nếu có lỗi nghiêm trọng (thối/mốc) hoặc tỷ lệ lỗi dập vượt ngưỡng -> Đề xuất FAIL.
+  + Nếu số quả quá ít (< min_objects) hoặc độ tin cậy AI thấp (< min_confidence) -> Đề xuất NEEDS_REVIEW.
+  + Nếu đạt tất cả chỉ số -> Đề xuất PASS.
+- Hiển thị bản ghi chi tiết RecordDetailWidget cho Inspector xem lại.
+  + Nút 'Back to Live Inspection': Quay lại chụp thêm ảnh nếu thấy bằng chứng chưa rõ.
+  + Nút 'Submit for Review': Inspector bấm gửi -> Phiên chuyển trạng thái sang PENDING_REVIEW -> Đẩy vào hàng đợi qua mạng LAN -> Màn hình tự động quay về Box Intake để kiểm tra hộp kế tiếp.
+
+GIAI ĐOẠN 5: THẨM ĐỊNH CHẤT LƯỢNG (REVIEWER TRÊN ReviewQueuePage)
+- Reviewer đăng nhập trên bất kỳ máy nào trong mạng LAN, mở ReviewQueuePage.
+- Danh sách hàng đợi hiển thị các phiên PENDING_REVIEW (sắp xếp theo phiên cũ nhất xếp trước).
+- Reviewer bấm vào một phiên để xem toàn bộ hồ sơ: Ảnh bằng chứng gốc, phân tích YOLO, kết quả OCR của Qwen-VL, ghi chú từ trạm kiểm định.
+- Reviewer nhập nhận xét và bấm 1 trong 3 quyết định cuối cùng:
+  1. PASS: Xác nhận lô hàng đạt chất lượng.
+  2. FAIL: Xác nhận lô hàng không đạt (trả hàng).
+  3. RE_INSPECT: Yêu cầu trạm kiểm tra lại (quét lại mã cũ sẽ tạo phiên mới làm lịch sử kiểm tra lại).
+- Hệ thống ghi nhận ReviewRecord, chuyển trạng thái phiên thành COMPLETED.
+- Số liệu hoàn tất tự động đồng bộ lên trang Dashboard và trang Báo cáo (Reports).
+
+GIAI ĐOẠN 6: QUẢN TRỊ DANH MỤC & CẤU HÌNH (ADMIN)
+- Catalog & Criteria: Admin chỉnh sửa ngưỡng lỗi từng loại quả, gán tệp model ONNX riêng (banana_defect.onnx). Có bản dịch tự động bằng ngôn ngữ tự nhiên (Plain-English Live Preview) để hiểu luật đánh giá. Khi bấm Save -> Tự động đồng bộ sang màn hình Box Intake.
+- Settings: Cấu hình IP máy chủ, kiểm tra kết nối nền không làm treo giao diện.
+
+Hãy vẽ sơ đồ dạng Flowchart có các khối hình, màu sắc phân biệt giữa các giai đoạn, mũi tên điều hướng và điều kiện rẽ nhánh (Yes/No, Thành công/Thất bại) rõ ràng."
+
+
+================================================================================
+PHẦN 3: PROMPT TỔNG HỢP (KẾT HỢP CẢ 2 NẾU VẼ TRÊN 1 SƠ ĐỒ LỚN)
+================================================================================
+(Copy toàn bộ đoạn văn bản trong dấu ngoặc kép dưới đây):
+
+"Hãy vẽ một sơ đồ hệ thống toàn diện (System Master Diagram) kết hợp cả 'Cấu trúc Phân quyền 3 Vai trò (RBAC)' và 'Luồng Vận hành Nghiệp vụ & Giao diện (End-to-End Workflow)' cho phần mềm trạm kiểm định chất lượng nông sản AgroScan.
+Sơ đồ cần thể hiện:
+1. Phía trên: 3 Vai trò (Admin, Inspector, Reviewer) và quyền hạn trên 9 trang giao diện (Dashboard, Box Intake, Live Inspection, Assessment Result, Review Queue, History, Reports, Catalog, Settings).
+2. Phía dưới: Quy trình nghiệp vụ 6 bước từ Đăng nhập (HMAC-SHA256) -> Tiếp nhận & quét mã QR 2D USB (bắt 7 lỗi mã) -> Kiểm định Camera + AI YOLO & Qwen-VL -> Python Rule Engine đối chiếu tiêu chí DB -> Reviewer thẩm định Pass/Fail/Re-inspect -> Cập nhật Dashboard & lưu trữ vĩnh viễn.
+3. Thể hiện sự chuyển đổi 3 trạng thái dữ liệu của phiên kiểm tra: IN_PROGRESS -> PENDING_REVIEW -> COMPLETED.
+Thiết kế dạng infographic hoặc flowchart chuyên nghiệp, có mũi tên liên kết rõ ràng giữa vai trò và các bước giao diện tương ứng."
+================================================================================
+

@@ -5,7 +5,7 @@ reused by the Catalog & Criteria editor, the future Excel/CSV import (D-029)
 and the PostgreSQL data-access layer.
 
 These rules only check that a configuration is *well-formed*; they do not
-change how the rule engine evaluates boxes (``mock_ai.assess_quality``).
+change how the rule engine evaluates boxes (``rule_engine.assess_quality``).
 """
 
 import re

@@ -40,6 +40,7 @@ class PlaceholderPage(ScrollPage):
         card.body.addWidget(make_hint(
             "Navigation and role-based access for this module are active; "
             "detailed UI and backend integration are pending."
+            "\nCác chức năng này bọn em sẽ triển khai khi xây xong dataset và nối được backend vào"
         ))
         self.body.addWidget(card)
         self.body.addStretch()

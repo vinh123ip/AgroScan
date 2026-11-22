@@ -1,5 +1,3 @@
-"""Layout building blocks shared by all pages."""
-
 from typing import Optional
 
 from PySide6.QtCore import Qt
@@ -60,7 +58,7 @@ class PageHeader(QWidget):
         title_label.setObjectName("PageTitle")
         title_row.addWidget(title_label)
         if is_mock:
-            badge = QLabel("MOCK DATA")
+            badge = QLabel("MOCK ")
             badge.setObjectName("MockBadge")
             badge.setToolTip("Data on this page is simulated until the database is connected.")
             title_row.addWidget(badge, alignment=Qt.AlignmentFlag.AlignVCenter)

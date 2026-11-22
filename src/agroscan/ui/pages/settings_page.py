@@ -273,8 +273,13 @@ class ConnectionSettingsForm(QWidget):
     def _run_check(self, key: str) -> None:
         cfg = self.current_settings()
         checks: dict[str, Callable[[], CheckResult]] = {
-            "db":      lambda: connection_checker.check_database(cfg.db_host, cfg.db_port),
-            "ai":      lambda: connection_checker.check_ai_service(cfg.ai_url, cfg.ai_timeout_s),
+            "db": lambda: connection_checker.check_database(
+                cfg.db_host,
+                cfg.db_port,
+                dbname=cfg.db_name,
+                user=cfg.db_user,
+            ),
+            "ai": lambda: connection_checker.check_ai_service(cfg.ai_url, cfg.ai_timeout_s),
             "storage": lambda: connection_checker.check_storage(cfg.storage_path),
         }
         self._test_buttons[key].setEnabled(False)

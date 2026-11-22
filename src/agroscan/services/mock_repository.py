@@ -28,7 +28,7 @@ from agroscan.models.inspection_models import (
     SessionStatus,
 )
 from agroscan.models.user_models import Role, User
-from agroscan.services import mock_ai
+from agroscan.services import mock_ai, rule_engine
 from agroscan.services.catalog_validation import validate_product
 from agroscan.services.mock_auth import MockAuthService
 
@@ -126,6 +126,90 @@ class MockRepository:
                 f"({', '.join(o.order_code for o in orders)}) and cannot be deleted."
             )
         self.products.remove(product)
+
+    def save_order(self, order: Order) -> Order:
+        """Insert or update an Order in the repository (T3.4)."""
+        code = order.order_code.strip().upper()
+        if not code:
+            raise ValueError("Order code cannot be empty.")
+        if order.total_boxes < 1:
+            raise ValueError("Total boxes must be >= 1.")
+        if order.expected_quantity < 1:
+            raise ValueError("Expected quantity must be >= 1.")
+        stored = Order(
+            order_code=code,
+            product=order.product,
+            supplier=order.supplier.strip() or "Unknown Supplier",
+            total_boxes=int(order.total_boxes),
+            expected_quantity=int(order.expected_quantity),
+            created_at=order.created_at,
+        )
+        self.orders[code] = stored
+        return stored
+
+    def import_orders(self, rows: list[dict[str, object]]) -> tuple[int, list[str]]:
+        """Validate and import a batch of order dicts from CSV/Excel (T3.4)."""
+        imported = 0
+        errors: list[str] = []
+        for idx, row in enumerate(rows, start=1):
+            order_code = str(row.get("order_code") or "").strip().upper()
+            product_code = str(row.get("product_code") or "").strip().upper()
+            supplier = str(row.get("supplier") or "").strip()
+            if not order_code or not product_code or not supplier:
+                errors.append(f"Row {idx}: Missing order_code, product_code, or supplier.")
+                continue
+            product = self.find_product(product_code)
+            if product is None:
+                errors.append(f"Row {idx} ({order_code}): Product '{product_code}' does not exist.")
+                continue
+            try:
+                total_boxes = int(str(row.get("total_boxes") or "0").strip())
+                expected_qty = int(str(row.get("expected_quantity") or "0").strip())
+                if total_boxes < 1 or expected_qty < 1:
+                    raise ValueError("Boxes and quantity must be positive integers.")
+            except ValueError as exc:
+                errors.append(f"Row {idx} ({order_code}): {exc}")
+                continue
+
+            self.save_order(
+                Order(
+                    order_code=order_code,
+                    product=product,
+                    supplier=supplier,
+                    total_boxes=total_boxes,
+                    expected_quantity=expected_qty,
+                )
+            )
+            imported += 1
+        return imported, errors
+
+    def save_user(
+        self,
+        username: str,
+        display_name: str,
+        role: Role,
+        is_active: bool = True,
+        password: Optional[str] = None,
+    ) -> User:
+        """Create or update a user account in the repository (T3.5)."""
+        name = username.strip().lower()
+        if not name:
+            raise ValueError("Username cannot be empty.")
+        if not display_name.strip():
+            raise ValueError("Display name cannot be empty.")
+        existing = next((u for u in self.users if u.username == name), None)
+        if existing is None:
+            new_user = User(name, display_name.strip(), role, is_active=is_active)
+            self.users.append(new_user)
+            return copy.deepcopy(new_user)
+        existing.display_name = display_name.strip()
+        existing.role = role
+        existing.is_active = is_active
+        return copy.deepcopy(existing)
+
+    def record_export(self, fmt: str, file_path: str, filter_summary: str = "All") -> None:
+        """Append an entry to export_history (T3.2)."""
+        self.export_history.insert(0, (datetime.now(), fmt, file_path, filter_summary))
 
     def resolve_box(self, text: str) -> tuple[BoxCode, Order]:
         """Xác thực mã hộp quét được với danh sách đơn hàng.
@@ -280,7 +364,7 @@ class MockRepository:
         session.started_at = started
 
         detection = mock_ai.simulate_detection(order.product, self._rng)
-        assessment = mock_ai.assess_quality(order.product, detection)
+        assessment = rule_engine.assess_quality(order.product, detection)
         deep_analysis = (
             mock_ai.simulate_deep_analysis(session, detection, rng=self._rng)
             if assessment.recommendation != AiRecommendation.PASS or not review

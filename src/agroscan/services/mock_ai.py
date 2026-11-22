@@ -3,10 +3,8 @@
 Nothing here runs YOLO or Qwen-VL. Every result is flagged
 ``is_simulated=True`` so the UI can label it clearly.
 
-``assess_quality`` is a placeholder for the Python rule engine (D-023). It
-reads thresholds from ``Product.criteria`` (mock catalog values) and must be
-replaced by the real engine reading criteria from the database. The order in
-which rules are evaluated is not yet confirmed by the user.
+``assess_quality`` is only an alias kept for old callers; the real Python rule
+engine (D-023) lives in ``services.rule_engine``.
 """
 
 import json
@@ -15,8 +13,8 @@ from datetime import datetime, timedelta
 from enum import Enum
 from typing import Optional
 
+from agroscan.services import rule_engine
 from agroscan.models.inspection_models import (
-    AiRecommendation,
     DetectionResult,
     InspectionSession,
     Product,
@@ -59,40 +57,8 @@ def simulate_detection(product: Product, rng: Optional[random.Random] = None) ->
 
 
 def assess_quality(product: Product, detection: DetectionResult) -> QualityAssessmentResult:
-    """Placeholder rule engine (D-023) — xem docstring của module."""
-    ratios = {c.defect_class: detection.ratio(c.defect_class) for c in product.criteria}
-    reasons: list[str] = []
-
-    for criterion in product.criteria:
-        count = detection.class_counts.get(criterion.defect_class, 0)
-        if criterion.is_critical and count > 0:
-            reasons.append(f"Critical defect detected: {criterion.defect_class} ({count}).")
-    for criterion in product.criteria:
-        ratio = ratios[criterion.defect_class]
-        if not criterion.is_critical and ratio > criterion.max_ratio:
-            reasons.append(
-                f"{criterion.defect_class.capitalize()} ratio {ratio:.0%} exceeds "
-                f"limit {criterion.max_ratio:.0%}."
-            )
-    if reasons:
-        return QualityAssessmentResult(AiRecommendation.FAIL, reasons, ratios)
-
-    if detection.total_objects < product.min_objects:
-        reasons.append(
-            f"Only {detection.total_objects} objects detected "
-            f"(minimum {product.min_objects})."
-        )
-    if detection.mean_confidence < product.min_confidence:
-        reasons.append(
-            f"Detection confidence {detection.mean_confidence:.0%} is below "
-            f"{product.min_confidence:.0%}."
-        )
-    if reasons:
-        return QualityAssessmentResult(AiRecommendation.NEEDS_REVIEW, reasons, ratios)
-
-    return QualityAssessmentResult(
-        AiRecommendation.PASS, ["All defect ratios are within limits."], ratios
-    )
+    """Backward-compatible alias of ``rule_engine.assess_quality`` (D-023)."""
+    return rule_engine.assess_quality(product, detection)
 
 
 class VlmScenario(Enum):
