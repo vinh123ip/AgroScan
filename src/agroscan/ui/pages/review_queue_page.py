@@ -3,6 +3,7 @@
 from typing import Optional
 
 from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
@@ -20,6 +21,7 @@ from agroscan.models.inspection_models import (
     ReviewRecord,
 )
 from agroscan.models.user_models import User
+from agroscan.services.i18n import language_manager, tr
 from agroscan.services.mock_repository import MockRepository
 from agroscan.ui.components.data_table import DataTable
 from agroscan.ui.components.page_layout import PageHeader, SectionCard
@@ -45,10 +47,8 @@ class ReviewQueuePage(QWidget):
         root = QVBoxLayout(self)
         root.setContentsMargins(40, 32, 40, 28)
         root.setSpacing(20)
-        root.addWidget(PageHeader(
-            "Review Queue",
-            "Sessions waiting for a reviewer decision. Oldest first.",
-        ))
+        self.header = PageHeader(tr("review.title"), tr("review.subtitle"), is_mock=False)
+        root.addWidget(self.header)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.setObjectName("ReviewSplitter")
@@ -113,10 +113,34 @@ class ReviewQueuePage(QWidget):
         root.addWidget(splitter, 1)
 
         self.queue_table.itemSelectionChanged.connect(self._on_selection_changed)
+        self.detail.note_added.connect(self._on_note_added)
+
+        # Station Usability keyboard shortcuts (3.4.6.2)
+        self._sc_pass = QShortcut(QKeySequence("Ctrl+1"), self)
+        self._sc_fail = QShortcut(QKeySequence("Ctrl+2"), self)
+        self._sc_re = QShortcut(QKeySequence("Ctrl+3"), self)
+        self._sc_pass.activated.connect(lambda: self._on_decide(ReviewerDecision.PASS))
+        self._sc_fail.activated.connect(lambda: self._on_decide(ReviewerDecision.FAIL))
+        self._sc_re.activated.connect(lambda: self._on_decide(ReviewerDecision.RE_INSPECT))
+        language_manager().language_changed.connect(self.retranslate_ui)
+
+    def retranslate_ui(self, _lang: str = "") -> None:
+        labels = self.header.findChildren(QLabel)
+        if len(labels) >= 2:
+            labels[0].setText(tr("review.title"))
+            labels[1].setText(tr("review.subtitle"))
+        self.empty_label.setText(tr("review.empty"))
+        self.notes_field.setPlaceholderText(tr("review.notes_placeholder"))
+        title_lbl = self.decision_card.findChild(QLabel, "FormSectionTitle")
+        if title_lbl is not None:
+            title_lbl.setText(tr("review.decision_card").upper())
+        for decision, btn in self._decision_buttons.items():
+            btn.setText(tr(f"decision.{decision.value}"))
+        self.refresh()
 
     def refresh(self) -> None:
         pending = self._repo.pending_records()
-        self.count_label.setText(f"{len(pending)} PENDING")
+        self.count_label.setText(tr("review.pending_count", n=len(pending)))
         self.queue_table.set_rows([
             [
                 r.session.box_code.text,
@@ -139,7 +163,16 @@ class ReviewQueuePage(QWidget):
         self.decision_card.setVisible(has_record)
         self.notes_field.clear()
         if record:
-            self.detail.set_record(record)
+            versions = self._repo.box_versions(record.session.box_code)
+            self.detail.set_record(record, versions=versions)
+
+    def _on_note_added(self, session_id: str, text: str) -> None:
+        self._repo.add_attributed_note(session_id, self._user.username, self._user.role.value, text)
+        record: Optional[InspectionRecord] = self.queue_table.selected_payload()
+        if record is not None:
+            versions = self._repo.box_versions(record.session.box_code)
+            updated = next((r for r in versions if r.session_id == session_id), record)
+            self.detail.set_record(updated, versions=versions)
 
     def _on_decide(self, decision: ReviewerDecision) -> None:
         record: Optional[InspectionRecord] = self.queue_table.selected_payload()

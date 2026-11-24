@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
 from agroscan.services import connection_checker
 from agroscan.services.app_settings import AppSettings, ConnectionSettings
 from agroscan.services.connection_checker import CheckResult
+from agroscan.services.i18n import SUPPORTED_LANGUAGES, set_language, tr
 from agroscan.ui.components.page_layout import (
     PageHeader,
     ScrollPage,
@@ -147,6 +148,11 @@ class ConnectionSettingsForm(QWidget):
         camera_row.addWidget(refresh)
         station_form.addRow(self._label("Station Name"), self.station_name)
         station_form.addRow(self._label("Camera"), camera_row)
+        self.language_combo = QComboBox()
+        self.language_combo.setObjectName("FormCombo")
+        for code, label in SUPPORTED_LANGUAGES:
+            self.language_combo.addItem(label, userData=code)
+        station_form.addRow(self._label(tr("settings.language_label")), self.language_combo)
         station_card.body.addLayout(station_form)
         layout.addWidget(station_card)
 
@@ -225,6 +231,8 @@ class ConnectionSettingsForm(QWidget):
         self.storage_path.setText(cfg.storage_path)
         self.station_name.setText(cfg.station_name)
         self._fill_cameras(cfg.camera_id)
+        lang_idx = self.language_combo.findData(cfg.language)
+        self.language_combo.setCurrentIndex(max(lang_idx, 0))
         self.saved_label.setText(f"Stored in {self._settings.file_path}")
 
     def current_settings(self) -> ConnectionSettings:
@@ -238,10 +246,13 @@ class ConnectionSettingsForm(QWidget):
             storage_path=self.storage_path.text().strip(),
             camera_id=self._current_camera_id(),
             station_name=self.station_name.text().strip() or "STATION-01",
+            language=self.language_combo.currentData() or "en",
         )
 
     def _on_save(self) -> None:
-        self._settings.save(self.current_settings())
+        cfg = self.current_settings()
+        self._settings.save(cfg)
+        set_language(cfg.language)
         self.saved_label.setText("✔  Settings saved.")
         self.saved.emit()
 

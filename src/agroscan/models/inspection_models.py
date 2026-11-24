@@ -46,6 +46,25 @@ class ReviewerDecision(Enum):
     RE_INSPECT = "Re-inspect"
 
 
+class BoxZone(Enum):
+    """Bề mặt / góc chụp của hộp để đánh giá độ phủ toàn hộp (3.4.5.1)."""
+
+    TOP    = "top"
+    LEFT   = "left"
+    RIGHT  = "right"
+    BOTTOM = "bottom"
+    INNER  = "inner"
+
+
+#: 4 bề mặt bắt buộc để đạt 100% độ phủ toàn bộ hộp (INNER là góc bổ sung).
+REQUIRED_COVERAGE_ZONES: tuple[BoxZone, ...] = (
+    BoxZone.TOP,
+    BoxZone.LEFT,
+    BoxZone.RIGHT,
+    BoxZone.BOTTOM,
+)
+
+
 # ---------------------------------------------------------------------------
 # Catalog
 # ---------------------------------------------------------------------------
@@ -161,15 +180,60 @@ class InspectionSession:
 
 @dataclass
 class EvidenceImage:
-    """Ảnh tĩnh làm bằng chứng gốc (D-026).
+    """Ảnh tĩnh làm bằng chứng gốc (D-026, 3.4.5.1).
 
     ``sha256`` và ``relative_path`` để trống cho tới khi có tầng lưu trữ SMB.
+    ``zone`` đánh dấu bề mặt hộp được chụp để tính độ phủ toàn bộ hộp.
     """
 
     captured_at:     datetime = field(default_factory=datetime.now)
     is_auto_capture: bool = False
     relative_path:   str = ""
     sha256:          str = ""
+    zone:            BoxZone = BoxZone.TOP
+
+
+@dataclass(frozen=True)
+class BoxCoverageStatus:
+    """Trạng thái độ phủ toàn bộ hộp (Whole-Box Coverage, 3.4.5.1)."""
+
+    required_zones: tuple[BoxZone, ...]
+    captured_zones: frozenset[BoxZone]
+    total_images:   int
+
+    @property
+    def covered_required(self) -> int:
+        return sum(1 for z in self.required_zones if z in self.captured_zones)
+
+    @property
+    def missing_zones(self) -> list[BoxZone]:
+        return [z for z in self.required_zones if z not in self.captured_zones]
+
+    @property
+    def percentage(self) -> float:
+        if not self.required_zones:
+            return 100.0
+        return round((self.covered_required / len(self.required_zones)) * 100.0, 1)
+
+    @property
+    def is_complete(self) -> bool:
+        return len(self.missing_zones) == 0
+
+
+def compute_box_coverage(
+    evidence: list[EvidenceImage],
+    required_zones: tuple[BoxZone, ...] = REQUIRED_COVERAGE_ZONES,
+) -> BoxCoverageStatus:
+    """Tính độ phủ bề mặt hộp từ danh sách ảnh bằng chứng đã chụp."""
+    captured = frozenset(
+        ev.zone if isinstance(ev.zone, BoxZone) else BoxZone(str(ev.zone).lower())
+        for ev in evidence
+    )
+    return BoxCoverageStatus(
+        required_zones=required_zones,
+        captured_zones=captured,
+        total_images=len(evidence),
+    )
 
 
 @dataclass
@@ -212,15 +276,40 @@ class ReviewRecord:
 
 
 @dataclass
+class AttributedNote:
+    """Ghi chú định danh gắn tác giả, vai trò và dấu thời gian (3.4.5.9)."""
+
+    author:     str
+    role:       str
+    text:       str
+    created_at: datetime = field(default_factory=datetime.now)
+    note_id:    str = ""
+
+
+@dataclass
+class AuditEvent:
+    """Một mốc sự kiện trong Audit Trail của phiên kiểm định (3.4.5.9)."""
+
+    action:    str
+    actor:     str
+    role:      str
+    timestamp: datetime = field(default_factory=datetime.now)
+    details:   str = ""
+
+
+@dataclass
 class InspectionRecord:
     """Toàn bộ kết quả của một phiên, từ lúc gửi duyệt đến khi reviewer xác nhận."""
 
-    session:       InspectionSession
-    evidence:      list[EvidenceImage]
-    detection:     DetectionResult
-    assessment:    QualityAssessmentResult
-    deep_analysis: Optional[VlmAnalysis] = None   # Kết quả Qwen-VL schema 1.0 (nếu có)
-    review:        Optional[ReviewRecord] = None
+    session:          InspectionSession
+    evidence:         list[EvidenceImage]
+    detection:        DetectionResult
+    assessment:       QualityAssessmentResult
+    deep_analysis:    Optional[VlmAnalysis] = None   # Kết quả Qwen-VL schema 1.0 (nếu có)
+    review:           Optional[ReviewRecord] = None
+    attributed_notes: list[AttributedNote] = field(default_factory=list)
+    audit_trail:      list[AuditEvent] = field(default_factory=list)
+    version:          int = 1
 
     @property
     def session_id(self) -> str:
@@ -230,16 +319,27 @@ class InspectionRecord:
     def status(self) -> SessionStatus:
         return self.session.status
 
+    @property
+    def coverage(self) -> BoxCoverageStatus:
+        return compute_box_coverage(self.evidence)
+
 
 @dataclass
 class OrderSummary:
-    """Tổng hợp cấp đơn hàng từ kết quả từng hộp (D-022)."""
+    """Tổng hợp cấp đơn hàng từ kết quả từng hộp (D-022, 3.4.5.2)."""
 
     order:      Order
     passed:     int = 0
     failed:     int = 0
     pending:    int = 0   # Pending Review hoặc Re-inspect
     remaining:  int = 0   # Chưa kiểm tra
+    reinspect:  int = 0   # Số hộp được yêu cầu kiểm tra lại (tách riêng cho Dashboard)
+
+    @property
+    def completion_rate(self) -> float:
+        if self.order.total_boxes <= 0:
+            return 0.0
+        return round(((self.passed + self.failed) / self.order.total_boxes) * 100.0, 1)
 
     @property
     def text(self) -> str:

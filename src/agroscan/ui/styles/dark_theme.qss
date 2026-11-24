@@ -745,3 +745,98 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
     background: none;
     width: 0;
 }
+
+
+/* ====================================================
+   SPRINT 3.4: BILINGUAL, COVERAGE, AUDIT & NOTES
+   ==================================================== */
+
+#ReportsPage,
+#InspectionHistoryPage,
+#DataImportPage,
+#UsersPage {
+    background-color: #0F172A;
+}
+
+#LangToggleButton {
+    background-color: #1E293B;
+    color: #38BDF8;
+    border: 1px solid #334155;
+    border-radius: 8px;
+    font-size: 12px;
+    font-weight: 800;
+    padding: 0 12px;
+}
+#LangToggleButton:hover {
+    background-color: #273449;
+    border-color: #38BDF8;
+}
+
+#CoverageProgressBar {
+    background-color: #0F172A;
+    border: 1px solid #334155;
+    border-radius: 5px;
+    height: 10px;
+    color: transparent;
+}
+#CoverageProgressBar::chunk {
+    background-color: #38BDF8;
+    border-radius: 4px;
+}
+#CoverageProgressBar[complete="true"]::chunk {
+    background-color: #22C55E;
+}
+
+#CoveragePill {
+    font-size: 12px;
+    font-weight: 700;
+    padding: 5px 12px;
+    border-radius: 12px;
+    background-color: #1E293B;
+    color: #94A3B8;
+    border: 1px solid #334155;
+}
+#CoveragePill[covered="true"] {
+    background-color: #14532D;
+    color: #86EFAC;
+    border: 1px solid #22C55E;
+}
+
+#ReviewPill {
+    font-size: 13px;
+    font-weight: 700;
+    padding: 8px 14px;
+    border-radius: 10px;
+    background-color: #1E293B;
+    color: #E2E8F0;
+    border: 1px solid #334155;
+}
+#ReviewPill[kind="pending"] { color: #FCD34D; border-color: #D97706; }
+#ReviewPill[kind="reinspect"] { color: #C4B5FD; border-color: #7C3AED; }
+#ReviewPill[kind="passed"] { color: #86EFAC; border-color: #16A34A; }
+#ReviewPill[kind="failed"] { color: #FCA5A5; border-color: #DC2626; }
+
+#NoteItemCard {
+    background-color: #0F172A;
+    border: 1px solid #334155;
+    border-left: 3px solid #38BDF8;
+    border-radius: 8px;
+}
+#NoteAuthorMeta {
+    font-size: 12px;
+    font-weight: 700;
+    color: #38BDF8;
+}
+#NoteBodyText {
+    font-size: 13px;
+    color: #F1F5F9;
+}
+#VersionDiffBanner {
+    background-color: #1E293B;
+    color: #7DD3FC;
+    border: 1px solid #0284C7;
+    border-radius: 8px;
+    padding: 8px 12px;
+    font-size: 13px;
+    font-weight: 600;
+}
