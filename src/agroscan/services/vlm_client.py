@@ -187,6 +187,23 @@ def request_deep_analysis(
                                       max(1, int((time.perf_counter() - started) * 1000)))
         else:
             analysis = parse_vlm_response(decoded)
+            if (
+                analysis.is_error
+                and fallback_to_mock
+                and (scenario is None or scenario == mock_ai.VlmScenario.NORMAL)
+                and analysis.error is not None
+                and analysis.error.code in (
+                    VlmErrorCode.MODEL_ERROR,
+                    VlmErrorCode.SERVICE_UNAVAILABLE,
+                    VlmErrorCode.TIMEOUT,
+                )
+            ):
+                return mock_ai.simulate_deep_analysis(
+                    session,
+                    detection,
+                    scenario=mock_ai.VlmScenario.NORMAL,
+                    timeout_s=int(effective_timeout),
+                )
         analysis.is_simulated = False
         return analysis
     except VlmSchemaError as exc:

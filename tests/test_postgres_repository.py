@@ -2,6 +2,7 @@
 
 from contextlib import contextmanager
 from datetime import datetime
+import json
 import os
 from pathlib import Path
 import sys
@@ -38,6 +39,7 @@ from agroscan.models.user_models import Role
 from agroscan.services.app_settings import ConnectionSettings
 from agroscan.services.database import get_connection, parse_env_file, resolve_db_config
 from agroscan.services.evidence_service import capture_and_save_evidence
+from agroscan.services.pdf_report_service import export_inspection_record_pdf, export_report_excel
 from agroscan.services.postgres_auth import PostgresAuthService
 from agroscan.services.postgres_repository import PostgresRepository
 from agroscan.main import create_repository
@@ -254,6 +256,115 @@ class TestPostgresRepositoryLive(unittest.TestCase):
                 self.assertTrue(window.box_intake_page.load_code("AGS:DEMO-V12-02-04/04"))
             finally:
                 window.close()
+
+    def test_five_seed_scenarios_and_manifest_details(self) -> None:
+        with self.repo._connection() as conn, conn.cursor() as cur:
+            cur.execute("""
+                SELECT o.order_code, p.name, l.declared_boxes,
+                       (l.plan_snapshot->>'active_version')::int,
+                       (SELECT count(*) FROM agroscan.current_selections s
+                        JOIN agroscan.boxes b ON b.id = s.box_id WHERE b.lot_id = l.id),
+                       d.version, d.outcome
+                FROM agroscan.orders o
+                JOIN agroscan.lots l ON l.order_id = o.id
+                JOIN agroscan.inspection_profiles ip ON ip.id = l.profile_id
+                JOIN agroscan.products p ON p.id = ip.product_id
+                LEFT JOIN agroscan.latest_lot_decisions d ON d.lot_id = l.id
+                WHERE o.order_code LIKE 'DEMO-V12-%'
+                ORDER BY o.order_code
+            """)
+            summary_rows = cur.fetchall()
+            self.assertEqual(
+                summary_rows,
+                [
+                    ("DEMO-V12-01", "Apple", 3, None, 0, None, None),
+                    ("DEMO-V12-02", "Orange", 4, 2, 2, None, None),
+                    ("DEMO-V12-03", "Banana", 3, 1, 2, None, None),
+                    ("DEMO-V12-04", "Shrimp", 3, 1, 2, None, None),
+                    ("DEMO-V12-05", "Squid", 3, 1, 2, 1, "approve"),
+                ],
+            )
+            cur.execute("""
+                SELECT s.replaces_id, s.reason
+                FROM agroscan.sample_selections s
+                JOIN agroscan.boxes b ON b.id = s.box_id
+                WHERE b.lot_id = -120002 AND s.replaces_id IS NOT NULL
+            """)
+            replacement = cur.fetchone()
+            self.assertIsNotNone(replacement)
+            self.assertEqual(replacement[0], -120211)
+            self.assertIn("inaccessible", replacement[1].lower())
+
+            cur.execute("""
+                SELECT convert_from(d.manifest_bytes, 'UTF8')::jsonb
+                FROM agroscan.latest_lot_decisions d
+                WHERE d.lot_id = -120005
+            """)
+            manifest_raw = cur.fetchone()[0]
+            manifest = json.loads(manifest_raw) if isinstance(manifest_raw, str) else manifest_raw
+            self.assertEqual(manifest["d"], 1)
+            self.assertEqual(manifest["Ac"], 0)
+            self.assertEqual(manifest["Re"], 1)
+            self.assertEqual(manifest["recommendation"], "reject")
+            self.assertEqual(manifest["outcome"], "approve")
+            self.assertTrue(manifest["override_reason"])
+
+            cur.execute("""
+                SELECT inspection_id, code, machine_affected, denominator
+                FROM agroscan.box_rule_counts
+                WHERE inspection_id IN (-120512, -120521)
+                ORDER BY inspection_id, code
+            """)
+            rule_counts = cur.fetchall()
+            self.assertGreaterEqual(len(rule_counts), 4)
+
+    def test_submitted_seed_review_and_pdf_excel_export(self) -> None:
+        with self.isolated_writes(), tempfile.TemporaryDirectory() as tmp:
+            shrimp_seed, = self.repo.filter_records(text="INS--120411")
+            self.assertEqual(len(shrimp_seed.evidence), 3)
+            self.assertEqual(shrimp_seed.detection.total_objects, 4)
+
+            maker = self.repo.save_user(
+                f"insp-{uuid4().hex}", "Seed Inspector", Role.INSPECTOR, password="Temporary-Pass-123",
+            )
+            reviewer = self.repo.save_user(
+                f"rev-{uuid4().hex}", "Seed Reviewer", Role.REVIEWER, password="Temporary-Pass-123",
+            )
+            box, order = self.repo.resolve_box("AGS:DEMO-V12-04-02/03")
+            session = self.repo.create_session(box, order, maker.username, "STATION-SEED")
+            img = QImage(16, 16, QImage.Format.Format_RGB32)
+            img.fill(0xFF22AA44)
+            evidence = capture_and_save_evidence(img, session.session_id, storage_root=tmp)
+            evidence.zone = BoxZone.TOP
+            evidence.width_px = evidence.height_px = 16
+            evidence.model_file = "fruit_defect.onnx"
+            evidence.units = [DetectedUnit(2, 2, 6, 6, "fresh", 0.95)]
+            record = InspectionRecord(
+                session, [evidence], DetectionResult(1, {"fresh": 1}, 0.95, False),
+                QualityAssessmentResult(AiRecommendation.PASS, [], {}),
+            )
+            with patch("agroscan.services.postgres_repository.verify_evidence_integrity", return_value=True):
+                self.repo.submit_for_review(record, coverage_confirmed=True)
+            pending = next(r for r in self.repo.pending_records() if r.session_id == record.session_id)
+            self.repo.apply_review(
+                pending,
+                ReviewRecord(ReviewerDecision.PASS, reviewer.username, "Verified shrimp batches against seed."),
+            )
+            reread, = self.repo.filter_records(text=record.session_id)
+            self.assertEqual(reread.status, SessionStatus.COMPLETED)
+            self.assertEqual(reread.review.decision, ReviewerDecision.PASS)
+
+            squid_signed, = self.repo.filter_records(text="INS--120512")
+            pdf_path = export_inspection_record_pdf(
+                squid_signed, output_path=Path(tmp) / "squid_cert.pdf",
+            )
+            xlsx_path = export_report_excel(
+                [reread, squid_signed],
+                self.repo.sample_progress(),
+                output_path=Path(tmp) / "v12_report.xlsx",
+            )
+            self.assertTrue(pdf_path.is_file() and pdf_path.stat().st_size > 1000)
+            self.assertTrue(xlsx_path.is_file() and xlsx_path.stat().st_size > 1000)
 
 
 if __name__ == "__main__":

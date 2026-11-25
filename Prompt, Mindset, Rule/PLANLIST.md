@@ -1,21 +1,17 @@
-# PLANLIST.md — Kế hoạch Triển khai Độc lập (Solo Developer Plan)
-## DỰ ÁN AGROSCAN (13/11/2026 – 12/12/2026)
+# PLANLIST.md — Kế hoạch & Tác vụ Mở rộng Tiếp theo (AgroScan)
 
-> **Mục tiêu:** Kế hoạch hành động tập trung cho **một người tự triển khai toàn bộ hệ thống** từ nay đến ngày bảo vệ đồ án tốt nghiệp (~4 tuần). Triển khai tuần tự theo lát cắt dọc (*Vertical Slice*) để hoàn thiện bản chạy thật End-to-End và đóng gói nghiệm thu.
->
-> **Tiến độ hiện tại (23/11/2026):** Toàn bộ các mục phát triển mã nguồn, giao diện, báo cáo PDF/Excel, Qwen-VL REST API, lưu trữ SMB và cấu hình đóng gói PyInstaller (`T1.1` → `T4.5`) đã hoàn thành và được xóa khỏi danh sách chờ theo quy tắc dự án.
+> **Hiện trạng đến 26/11/2026:** Toàn bộ luồng kiểm định Desktop 12 bước, kết nối PostgreSQL v1.2 (15 bảng + 5 seed mẫu), song ngữ EN/VI, Qwen-VL HTTP Bridge, xuất PDF/Excel và bộ test tự động đã hoàn tất và tích hợp trên `main` và `develop`.
 
 ---
 
-## 1. Nguyên tắc sống còn khi làm việc một mình (Solo Strategy)
+## Các hạng mục mở rộng / hoàn thiện sau khi các thành viên khác pull `main`
 
-1. **Lát cắt dọc (Vertical Slice First):** Luồng `Quét mã` → `Camera/YOLO` → `Tính kết quả` → `Lưu DB` → `Xuất PDF` đã thông suốt hoàn toàn.
-2. **Đóng băng giao diện (UI Freeze):** Toàn bộ 11 màn hình chức năng đã hoàn thiện, xóa sạch `PlaceholderPage`.
-3. **Thu gọn bài toán AI:** Đã tích hợp `YoloEngine` (ONNX Runtime), `Simulation Feed` (D-031) và `server/qwen_service.py` (cầu nối REST API sang LM Studio).
-4. **Đơn giản hóa dữ liệu:** Đã kết nối PostgreSQL 18 (`PostgresRepository`) kèm cơ chế nạp đơn hàng từ CSV/Excel (`DataImportPage`).
-
----
-
-## 2. Danh mục nhiệm vụ còn lại (Task List)
-
-*(Không còn nhiệm vụ tồn đọng — Toàn bộ các hạng mục `T1.1` → `T4.5` đã hoàn tất. Khi bảo vệ đồ án chỉ cần bật LM Studio nạp model Qwen-VL ở ngoài và chạy kịch bản trong `docs/demo_presentation_flow.md`.)*
+1. **Huấn luyện & đánh giá model YOLO thực tế:**
+   - Gán nhãn tập ảnh nông/thủy sản thật và xuất model chuyên biệt qua `scripts/export_yolo_onnx.py` để thay thế model baseline khi cần.
+   - Ghi nhận kết quả mAP@0.5 trên tập kiểm thử độc lập (thẻ Trello `3.1.5.5`).
+2. **Đo kiểm VLM Qwen2-VL / Qwen2.5-VL trên phần cứng mục tiêu:**
+   - Chạy thử nghiệm thực tế với Ollama hoặc LM Studio trên máy chủ GPU và cập nhật bổ sung `docs/benchmark_report.md` (thẻ `3.2.5.3`).
+3. **Khởi tạo tệp `agroscan.spec` và đóng gói `AgroScan.exe`:**
+   - Tạo `agroscan.spec` cho PyInstaller và kiểm thử chạy `scripts/build_exe.bat` trên máy Windows sạch không cài Python.
+4. **Hoàn thiện UI thao tác khóa kế hoạch & ký quyết định cấp lô trực tiếp (tùy chọn mở rộng v1.2):**
+   - Hiện `PostgresRepository` đọc đầy đủ `current_selections`, `latest_lot_decisions` và kiểm chứng khóa kế hoạch/chữ ký RSA-PSS ở tầng DB; có thể bổ sung màn hình tạo/điều chỉnh kế hoạch lấy mẫu và ký lô trực tiếp trên desktop nếu mở rộng thêm.

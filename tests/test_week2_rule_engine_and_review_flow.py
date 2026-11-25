@@ -11,9 +11,11 @@ import os
 import sys
 import tempfile
 import unittest
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from unittest import mock
+from uuid import uuid4
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -35,8 +37,10 @@ from agroscan.models.inspection_models import (
     ReviewerDecision,
     SessionStatus,
 )
+from agroscan.models.user_models import Role
 from agroscan.services import mock_ai, rule_engine
 from agroscan.services.app_settings import AppSettings
+from agroscan.services.database import get_connection
 from agroscan.services.evidence_service import (
     capture_and_save_evidence,
     configure_evidence_storage,
@@ -44,6 +48,8 @@ from agroscan.services.evidence_service import (
 )
 from agroscan.services.mock_auth import MockAuthService
 from agroscan.services.mock_repository import MockRepository
+from agroscan.services.postgres_auth import PostgresAuthService
+from agroscan.services.postgres_repository import PostgresRepository
 from agroscan.ui.components.evidence_strip import EvidenceStrip
 from agroscan.ui.components.evidence_viewer_dialog import EvidenceViewerDialog
 from agroscan.ui.main_window import MainWindow
@@ -259,6 +265,109 @@ class TestFlowWithMockRepository(_FlowMixin, unittest.TestCase):
     def test_intake_live_assessment_review_flow(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             self._run_flow(self.repo, tmp)
+
+
+class TestFlowWithPostgresRepository(_FlowMixin, unittest.TestCase):
+    def setUp(self) -> None:
+        self.repo = PostgresRepository()
+        ok, message = self.repo.ping()
+        self.assertTrue(ok, message)
+        self.created_session_ids = []
+
+    @contextmanager
+    def _isolated_writes(self):
+        connection = get_connection(self.repo.db_config)
+        try:
+            @contextmanager
+            def use_transaction():
+                with connection.cursor() as cur:
+                    cur.execute("SAVEPOINT flow_call")
+                    cur.execute("SET CONSTRAINTS ALL DEFERRED")
+                try:
+                    yield connection
+                    with connection.cursor() as cur:
+                        cur.execute("SET CONSTRAINTS ALL IMMEDIATE")
+                        cur.execute("RELEASE SAVEPOINT flow_call")
+                except Exception:
+                    with connection.cursor() as cur:
+                        cur.execute("ROLLBACK TO SAVEPOINT flow_call")
+                        cur.execute("RELEASE SAVEPOINT flow_call")
+                    raise
+
+            with mock.patch.object(self.repo, "_connection", use_transaction):
+                yield
+        finally:
+            connection.rollback()
+            connection.close()
+
+    def test_intake_live_assessment_review_flow_postgres(self) -> None:
+        with self._isolated_writes(), tempfile.TemporaryDirectory() as tmp:
+            settings = self._make_settings(tmp)
+            inspector = self.repo.save_user(
+                f"insp-{uuid4().hex}", "Flow Inspector", Role.INSPECTOR, password="Temporary-Pass-123",
+            )
+            reviewer = self.repo.save_user(
+                f"rev-{uuid4().hex}", "Flow Reviewer", Role.REVIEWER, password="Temporary-Pass-123",
+            )
+            auth = PostgresAuthService(self.repo)
+            window = MainWindow(inspector, auth, self.repo, settings)
+            try:
+                intake = window.box_intake_page
+                live = window.live_inspection_page
+                result_page = window.assessment_result_page
+
+                self.assertTrue(intake.load_code("AGS:DEMO-V12-04-02/03"))
+                intake.btn_start.click()
+                self.assertIsNotNone(live.session)
+                self.created_session_ids.append(live.session.session_id)
+
+                live.feed_mode_combo.setCurrentIndex(1)
+                live.sim_sample_combo.setCurrentIndex(2)
+                self.assertTrue(live._yolo_engine.load_model("fruit_defect.onnx"))
+                live._on_capture()
+                live._on_finish()
+                self.assertEqual(window.current_page, PageKey.ASSESSMENT_RESULT)
+                record = window._assessment_record
+                self.assertIsNotNone(record)
+                with mock.patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes):
+                    result_page.btn_submit.click()
+
+                self.assertIsNone(live.session)
+                self.assertEqual(record.session.product.code, "SHRIMP")
+                self.assertFalse(record.detection.is_simulated)
+                self.assertEqual(record.status, SessionStatus.PENDING_REVIEW)
+
+                page = ReviewQueuePage(self.repo, reviewer)
+                rows = [
+                    r for r in range(page.queue_table.rowCount())
+                    if page.queue_table.payload_at(r).session_id == record.session_id
+                ]
+                self.assertEqual(len(rows), 1)
+                page.queue_table.selectRow(rows[0])
+                page._on_selection_changed()
+                selected = page.queue_table.selected_payload()
+                self.assertEqual(selected.evidence[0].sha256, record.evidence[0].sha256)
+
+                dialog = EvidenceViewerDialog(selected.evidence[0], None, parent=page)
+                self.assertTrue(dialog.has_image)
+                self.assertEqual(dialog.integrity_state, "verified")
+                dialog.deleteLater()
+
+                page.notes_field.setPlainText("Verified shrimp box flow in PostgreSQL v1.2.")
+                page._on_decide(ReviewerDecision.FAIL)
+
+                reloaded = [
+                    r for r in self.repo.records_for_box(record.session.box_code)
+                    if r.session_id == record.session_id
+                ]
+                self.assertEqual(len(reloaded), 1)
+                self.assertEqual(reloaded[0].status, SessionStatus.COMPLETED)
+                self.assertEqual(reloaded[0].review.decision, ReviewerDecision.FAIL)
+                page.deleteLater()
+            finally:
+                window.shutdown()
+                window.deleteLater()
+                configure_evidence_storage(None)
 
 
 class TestEvidenceViewerT24(unittest.TestCase):

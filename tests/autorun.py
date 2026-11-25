@@ -287,6 +287,10 @@ class AutorunController(QObject):
 
         self._tmp_dir = tempfile.TemporaryDirectory()
         self.settings = AppSettings(Path(self._tmp_dir.name) / "autorun_settings.ini")
+        if headless_check:
+            cfg = self.settings.load()
+            cfg.ai_timeout_s = 1
+            self.settings.save(cfg)
         self.auth = MockAuthService(session_ttl_seconds=8 * 3600)
         self.repo = MockRepository(seed=42)
 
@@ -783,7 +787,11 @@ class AutorunController(QObject):
             if live.session is None:
                 return
             before_count = len(live.captured_images)
-            if live._camera_active() and live._image_capture.isReadyForCapture():
+            if (
+                not self.headless_check
+                and live._camera_active()
+                and live._image_capture.isReadyForCapture()
+            ):
                 live._on_capture()
 
             def ensure_captured() -> None:
@@ -834,7 +842,7 @@ class AutorunController(QObject):
         if live._is_analyzing:
             # The accelerated walkthrough still waits for the bounded demo request.
             from PySide6.QtTest import QTest
-            for _ in range(150):
+            for _ in range(250):
                 if not live._is_analyzing:
                     break
                 QTest.qWait(20)

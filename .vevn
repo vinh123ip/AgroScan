@@ -1,7 +1,0 @@
-# Copy this file to .env and fill in your local PostgreSQL credentials.
-# Never commit .env to version control.
-AGROSCAN_DB_HOST=127.0.0.1
-AGROSCAN_DB_PORT=5432
-AGROSCAN_DB_NAME=agroscan
-AGROSCAN_DB_USER=postgres
-AGROSCAN_DB_PASSWORD=
