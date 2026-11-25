@@ -10,7 +10,7 @@ import psycopg2
 from psycopg2.extras import Json
 
 from agroscan.models.inspection_models import (
-    AiRecommendation, BoxCode, DefectCriterion, DetectionResult, EvidenceImage,
+    AiRecommendation, AttributedNote, AuditEvent, BoxCode, BoxZone, DefectCriterion, DetectionResult, EvidenceImage,
     InspectionRecord, InspectionSession, Order, OrderSummary, Product,
     QualityAssessmentResult, ReviewerDecision, ReviewRecord, SessionStatus,
 )
@@ -286,7 +286,8 @@ class PostgresRepository:
                 SELECT l.id, o.order_code, l.lot_code, count(*) OVER (PARTITION BY o.id),
                        o.supplier, l.declared_boxes, o.imported_at, p.code, p.name, p.category,
                        f.applicability, coalesce(r.rules, '[]'::jsonb),
-                       (a.details->>'expected_quantity')::int, d.outcome
+                       (a.details->>'expected_quantity')::int, d.outcome, d.version,
+                       convert_from(d.manifest_bytes,'UTF8')::jsonb
                 FROM agroscan.lots l JOIN agroscan.orders o ON o.id=l.order_id
                 JOIN agroscan.inspection_profiles f ON f.id=l.profile_id
                 JOIN agroscan.products p ON p.id=f.product_id
@@ -305,12 +306,15 @@ class PostgresRepository:
                 ORDER BY o.order_code, l.lot_code
             """)
             orders = {}
-            for lot_id, order_code, lot_code, count, supplier, boxes, imported, code, name, category, config, rules, quantity, outcome in cur.fetchall():
+            for lot_id, order_code, lot_code, count, supplier, boxes, imported, code, name, category, config, rules, quantity, outcome, decision_version, manifest in cur.fetchall():
                 key = order_code if count == 1 else f"{order_code}:{lot_code}"
                 orders[key.upper()] = Order(
                     key, self._product(code, name, category, config, rules),
                     supplier or "", boxes, quantity, _local(imported),
                     lot_id=lot_id, lot_code=lot_code, lot_outcome=outcome,
+                    decision_version=decision_version, sampling_recommendation=(manifest or {}).get("recommendation"),
+                    override_reason=(manifest or {}).get("override_reason"),
+                    signed_attempts=tuple(f"INS-{slot['attempt_id']}" for slot in (manifest or {}).get("slots", [])),
                 )
             return orders
 
@@ -422,7 +426,8 @@ class PostgresRepository:
                        i.machine_box_result,reviewer.login,i.review_note,i.reviewed_at,i.box_result,
                        ev.images,coalesce(stats.num_objects,0), coalesce(stats.ratios,'{{}}'::jsonb),
                        i.checkpoint->>'notes', submitted.details->'workstation_vlm_analysis',
-                       submitted.details->'workstation_vlm_simulated', ev.demo
+                       submitted.details->'workstation_vlm_simulated', ev.demo, i.attempt_no,
+                       i.coverage->>'confirmed', submitted.details->'view_zones'
                 FROM agroscan.inspections i
                 JOIN agroscan.sample_selections s ON s.id=i.selection_id
                 JOIN boxes b ON b.id=s.box_id
@@ -449,18 +454,35 @@ class PostgresRepository:
             """, (list(orders),))
             rows = cur.fetchall()
             cur.execute("""
-                SELECT id, coalesce(captured_at, received_at), object_key, sha256
-                FROM agroscan.inspection_images
-            """)
+                SELECT id, coalesce(captured_at,received_at), object_key, sha256,
+                       width_px, height_px, source_kind, usage_context
+                FROM agroscan.inspection_images WHERE id=ANY(%s)
+            """, ([image for row in rows for image in (row[12] or [])],))
             images = {
-                image_id: EvidenceImage(_local(timestamp), False, key, sha)
-                for image_id, timestamp, key, sha in cur.fetchall()
+                image_id: EvidenceImage(_local(ts), False, key, digest, width, height,
+                                        source, context == "demo")
+                for image_id, ts, key, digest, width, height, source, context in cur.fetchall()
             }
+            cur.execute("""
+                SELECT a.target_key,a.id,a.occurred_at,a.action,u.login,u.role,u.can_review,
+                       a.details->>'text'
+                FROM agroscan.audit_logs a LEFT JOIN agroscan.users u ON u.id=a.actor_id
+                WHERE a.target_type='inspection' AND a.target_key=ANY(%s)
+                ORDER BY a.occurred_at,a.id
+            """, ([str(row[0]) for row in rows],))
+            events, notes_by_id = defaultdict(list), defaultdict(list)
+            for key, event_id, ts, action, actor, role, can_review, message in cur.fetchall():
+                label = "Reviewer" if can_review else (role or "system").title()
+                if action == "review_note_added":
+                    label = "Reviewer"
+                    notes_by_id[key].append(AttributedNote(actor, label, message, _local(ts), str(event_id)))
+                events[key].append(AuditEvent(action, actor or "System", label, _local(ts), message or ""))
         records = []
+        known_zones = {zone.value: zone for zone in BoxZone}
         for row in rows:
             (identifier, lot_id, number, inspector, station, state, started, result,
              reviewer, notes, reviewed, verdict, image_ids, observed, ratios,
-             inspection_notes, vlm_payload, vlm_simulated, demo) = row
+             inspection_notes, vlm_payload, vlm_simulated, demo, attempt, confirmed, zones) = row
             order = orders[lot_id]
             session = InspectionSession(
                 f"INS-{identifier}", BoxCode(order.order_code.upper(), number, order.total_boxes),
@@ -488,14 +510,42 @@ class PostgresRepository:
                 vlm = None
             if vlm:
                 vlm.is_simulated = bool(vlm_simulated)
+            evidence = [images[x] for x in image_ids or []]
+            for image in evidence:
+                tag = (zones or {}).get(image.relative_path)
+                if tag in known_zones:
+                    image.zone = known_zones[tag]
             records.append(InspectionRecord(
-                session, [images[x] for x in image_ids or []], detection, evaluation,
-                deep_analysis=vlm, review=decision,
+                session, evidence, detection, evaluation,
+                deep_analysis=vlm, review=decision, version=attempt,
+                whole_box_confirmed=confirmed == "true", audit_trail=events[str(identifier)],
+                attributed_notes=notes_by_id[str(identifier)],
             ))
         return records
 
     def records_for_box(self, box_code: BoxCode) -> list[InspectionRecord]:
         return [record for record in self.records if record.session.box_code == box_code]
+
+    def box_versions(self, box_code: BoxCode) -> list[InspectionRecord]:
+        return sorted(self.records_for_box(box_code), key=lambda record: record.session.started_at)
+
+    def add_attributed_note(self, session_id: str, author: str, role: str, text: str) -> AttributedNote:
+        message = text.strip()
+        if not message:
+            raise ValueError("Enter a review note.")
+        with self._connection() as conn, conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO agroscan.audit_logs (actor_id,action,target_type,target_key,details)
+                SELECT u.id,'review_note_added','inspection',i.id::text,
+                       jsonb_build_object('text',%s::text,'attempt_no',i.attempt_no)
+                FROM agroscan.inspections i CROSS JOIN agroscan.users u
+                WHERE i.id::text=%s AND u.login=%s AND u.active AND u.can_review
+                RETURNING id, occurred_at
+            """, (message, session_id.removeprefix("INS-"), author))
+            row = cur.fetchone()
+            if row is None:
+                raise ValueError("An active Reviewer and an existing inspection are required.")
+            return AttributedNote(author, Role.REVIEWER.value, message, _local(row[1]), str(row[0]))
 
     def _active_attempt(self, cur, order, box_code, inspector):
         cur.execute(f"""
@@ -674,7 +724,9 @@ class PostgresRepository:
                     SET state='submitted',submitted_at=%s,coverage=%s,machine_box_result=%s
                     WHERE id=%s
                 """, (submitted, Json(coverage), Json(result), inspection_id))
-                details = {"operation_id": session.session_id}
+                details = {"operation_id": session.session_id, "view_zones": {
+                    im.relative_path: im.zone.value for im in items if im.zone is not None
+                }}
                 if record.deep_analysis:
                     details["workstation_vlm_analysis"] = record.deep_analysis.to_dict()
                     details["workstation_vlm_simulated"] = record.deep_analysis.is_simulated
@@ -684,6 +736,7 @@ class PostgresRepository:
                 """, (actor, str(inspection_id), Json(details), submitted))
         session.session_id = f"INS-{inspection_id}"
         session.status = SessionStatus.PENDING_REVIEW
+        record.whole_box_confirmed = True
         record.assessment.recommendation = _RECOMMENDATION.get(
             result["outcome"], AiRecommendation.NEEDS_REVIEW,
         )
@@ -699,12 +752,17 @@ class PostgresRepository:
                 SET state=%s, reviewer_id=u.id, reviewed_at=clock_timestamp(), box_result=%s, review_note=%s
                 FROM agroscan.users u
                 WHERE i.id=%s AND i.state='submitted' AND u.login=%s AND u.active AND u.can_review
-                RETURNING i.reviewed_at
+                RETURNING i.reviewed_at,u.id,i.id,i.attempt_no
             """, ("reviewed" if box_result else "reinspect", box_result, review.notes.strip(),
                   int(record.session_id.removeprefix("INS-")), review.reviewer))
             row = cur.fetchone()
             if not row:
                 raise ValueError("The attempt is no longer pending or this reviewer is unauthorized.")
+            cur.execute("""
+                INSERT INTO agroscan.audit_logs (actor_id,action,target_type,target_key,details,occurred_at)
+                VALUES (%s,'inspection_reviewed','inspection',%s,%s,%s)
+            """, (row[1], str(row[2]), Json({"decision": review.decision.value, "text": review.notes.strip(),
+                                           "attempt_no": row[3]}), row[0]))
         review.reviewed_at = _local(row[0])
         record.review = review
         record.session.status = SessionStatus.COMPLETED
@@ -750,14 +808,42 @@ class PostgresRepository:
                 record = latest.get(BoxCode(order.order_code, box_no, order.total_boxes))
                 if record is None:
                     summary.remaining += 1
-                elif record.review is None or record.review.decision == ReviewerDecision.RE_INSPECT:
+                elif record.review is None:
                     summary.pending += 1
+                elif record.review.decision == ReviewerDecision.RE_INSPECT:
+                    summary.pending += 1
+                    summary.reinspect += 1
                 elif record.review.decision == ReviewerDecision.PASS:
                     summary.passed += 1
                 else:
                     summary.failed += 1
             summaries.append(summary)
         return summaries
+
+    def sample_progress(self) -> list[OrderSummary]:
+        """Count each active sample slot once, using its latest inspection attempt."""
+        with self._connection() as conn, conn.cursor() as cur:
+            orders = self._fetch_orders(conn)
+            cur.execute("""
+                SELECT b.lot_id, count(*),
+                       count(*) FILTER (WHERE i.state='reviewed' AND i.box_result='conforming'),
+                       count(*) FILTER (WHERE i.state='reviewed' AND i.box_result='nonconforming'),
+                       count(*) FILTER (WHERE i.state IN ('submitted','reinspect')),
+                       count(*) FILTER (WHERE i.state='reinspect')
+                FROM agroscan.current_selections s JOIN agroscan.boxes b ON b.id=s.box_id
+                LEFT JOIN LATERAL (
+                    SELECT state,box_result FROM agroscan.inspections WHERE selection_id=s.id
+                    ORDER BY attempt_no DESC LIMIT 1
+                ) i ON true
+                GROUP BY b.lot_id
+            """)
+            counts = {lot: values for lot, *values in cur.fetchall()}
+        result = []
+        for order in orders.values():
+            total, passed, failed, pending, reinspect = counts.get(order.lot_id, (0, 0, 0, 0, 0))
+            result.append(OrderSummary(order, passed, failed, pending, total-passed-failed-pending,
+                                       reinspect, required_boxes=total))
+        return result
 
     def daily_outcomes(
         self, start: date, end: date, product_code: Optional[str] = None
@@ -785,13 +871,18 @@ class PostgresRepository:
         status: Optional[SessionStatus] = None,
         start: Optional[date] = None,
         end: Optional[date] = None,
+        outcome: Optional[str] = None,
     ) -> list[InspectionRecord]:
         needle = text.strip().upper()
         result = []
         for record in self.all_records():
             session = record.session
             day = session.started_at.date()
-            if needle and needle not in session.box_code.text.upper() and needle not in session.session_id.upper():
+            identifiers = (session.box_code.text, session.session_id, session.order.lot_code or "")
+            if needle and not any(needle in value.upper() for value in identifiers):
+                continue
+            decision = record.review.decision if record.review else record.assessment.recommendation
+            if outcome and decision.value.casefold() != outcome.casefold():
                 continue
             if product_code and session.product.code != product_code:
                 continue

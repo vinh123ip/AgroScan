@@ -18,7 +18,6 @@ from PySide6.QtWidgets import (
 from agroscan.models.user_models import AuthSession, User
 from agroscan.services.app_settings import AppSettings
 from agroscan.services.mock_auth import MockAuthService
-from agroscan.ui.pages.settings_page import ConnectionSettingsDialog
 
 
 class LoginDialog(QDialog):
@@ -136,10 +135,6 @@ class LoginDialog(QDialog):
         root.addStretch()
 
         footer = QHBoxLayout()
-        self.btn_connection = QPushButton("⚙  Connection Settings")
-        self.btn_connection.setObjectName("LinkButton")
-        self.btn_connection.setCursor(Qt.CursorShape.PointingHandCursor)
-        footer.addWidget(self.btn_connection)
         footer.addStretch()
         demo = QLabel("DEMO MODE" if demo_accounts else "POSTGRESQL")
         demo.setObjectName("DemoBadge")
@@ -152,7 +147,6 @@ class LoginDialog(QDialog):
         self.username.textChanged.connect(lambda: self.error_label.setVisible(False))
         self.password.textChanged.connect(lambda: self.error_label.setVisible(False))
         self.btn_toggle_pw.clicked.connect(self._toggle_password_visibility)
-        self.btn_connection.clicked.connect(self._on_connection_settings)
 
     def _restore_preferences(self) -> None:
         self._refresh_station_label()
@@ -202,7 +196,3 @@ class LoginDialog(QDialog):
     def _show_error(self, message: str) -> None:
         self.error_label.setText(f"⚠   {message}")
         self.error_label.setVisible(True)
-
-    def _on_connection_settings(self) -> None:
-        ConnectionSettingsDialog(self._settings, self).exec()
-        self._refresh_station_label()

@@ -15,6 +15,7 @@ import json
 import os
 import random
 import sys
+import time
 import tempfile
 import unittest
 from pathlib import Path
@@ -252,7 +253,8 @@ class TestChecklist3QrScannerAndOrderLookup(unittest.TestCase):
 
         live._on_image_captured(1, QImage(64, 64, QImage.Format.Format_RGB32))
         live.next_scan_field.setText("AGS:DH00124-03/08")
-        live._on_next_scanned()
+        with patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes):
+            live._on_next_scanned()
         self.assertEqual(live.session.box_code, BoxCode("DH00124", 3, 8))
         self.assertEqual(len(self.repo.records_for_box(BoxCode("DH00124", 2, 8))), 1)
 
@@ -389,14 +391,21 @@ class TestChecklist4And5VlmSchemaAndResultPanel(unittest.TestCase):
         stale_token = live._analysis_token
         live._on_cancel_deep_analysis()
         self.assertEqual(live.vlm_panel.state, "idle")
-        live._on_deep_analysis_done(stale_token)
+        live._on_deep_analysis_done(stale_token, None)
         self.assertEqual(live.vlm_panel.state, "idle")
+
+        def wait_for_result():
+            deadline = time.monotonic() + 5
+            while live._is_analyzing and time.monotonic() < deadline:
+                QApplication.processEvents()
+                time.sleep(0.01)
+            self.assertFalse(live._is_analyzing)
 
         # Simulated TIMEOUT error shows error state in panel without polluting record
         idx = live.scenario_combo.findData(mock_ai.VlmScenario.TIMEOUT)
         live.scenario_combo.setCurrentIndex(idx)
         live._on_deep_analysis()
-        live._on_deep_analysis_done(live._analysis_token)
+        wait_for_result()
         self.assertEqual(live.vlm_panel.state, "error")
         record = live.finalize()
         assert record is not None
@@ -406,7 +415,7 @@ class TestChecklist4And5VlmSchemaAndResultPanel(unittest.TestCase):
         idx_ok = live.scenario_combo.findData(mock_ai.VlmScenario.NORMAL)
         live.scenario_combo.setCurrentIndex(idx_ok)
         live._on_deep_analysis()
-        live._on_deep_analysis_done(live._analysis_token)
+        wait_for_result()
         self.assertEqual(live.vlm_panel.state, "result")
         record_ok = live.finalize()
         assert record_ok is not None and record_ok.deep_analysis is not None

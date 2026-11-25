@@ -24,7 +24,7 @@ if str(SRC_DIR) not in sys.path:
 
 from PySide6.QtCore import QSettings
 from PySide6.QtGui import QColor, QImage
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QMessageBox
 
 from agroscan.models.inspection_models import (
     AiRecommendation,
@@ -180,7 +180,8 @@ class _FlowMixin:
         self.assertEqual(window.current_page, PageKey.ASSESSMENT_RESULT)
         record = window._assessment_record
         self.assertIsNotNone(record)
-        result_page.btn_submit.click()
+        with mock.patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes):
+            result_page.btn_submit.click()
         return record
 
     def _run_flow(self, repo, tmp: str) -> None:

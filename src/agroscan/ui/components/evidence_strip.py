@@ -74,7 +74,8 @@ class EvidenceStrip(QWidget):
         thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
         thumb.setCursor(Qt.CursorShape.PointingHandCursor)
         source = "AUTO" if item.is_auto_capture else "MANUAL"
-        tooltip_lines = [f"{source} capture · {item.captured_at:%H:%M:%S}"]
+        zone_tag = item.zone.value.upper() if item.zone else "VIEW"
+        tooltip_lines = [f"[{zone_tag}] {source} capture · {item.captured_at:%H:%M:%S}"]
         if item.relative_path:
             tooltip_lines.append(f"File: {item.relative_path}")
         if item.sha256:
@@ -93,7 +94,7 @@ class EvidenceStrip(QWidget):
             ))
         else:
             hash_tag = f"\n#{item.sha256[:8]}" if item.sha256 else ""
-            thumb.setText(f"IMAGE\n{item.captured_at:%H:%M:%S}{hash_tag}")
+            thumb.setText(f"[{zone_tag}]\n{item.captured_at:%H:%M:%S}{hash_tag}")
 
         index = len(self._items)
         self._items.append(item)

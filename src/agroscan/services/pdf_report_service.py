@@ -207,7 +207,7 @@ def export_inspection_record_pdf(
     story.append(
         Paragraph(
             f"Generated: {fmt_datetime(datetime.now())}   |   "
-            f"Session ID: {session.session_id}   |   Final Outcome: {final_result_text(record)}",
+            f"Session ID: {session.session_id}   |   Final Outcome: {final_result_text(record, lang='en')}",
             st["subtitle"],
         )
     )
@@ -422,7 +422,7 @@ def export_summary_report_pdf(
                 r.session.box_code.text,
                 r.session.product.code,
                 r.assessment.recommendation.value,
-                final_result_text(r),
+                final_result_text(r, lang='en'),
                 fmt_datetime(r.session.started_at),
                 first_sha,
             ]
@@ -556,7 +556,7 @@ def export_report_excel(
                 r.detection.total_objects,
                 round(r.detection.mean_confidence, 3),
                 r.assessment.recommendation.value,
-                final_result_text(r),
+                final_result_text(r, lang='en'),
                 r.review.reviewer if r.review else "",
                 r.review.notes if r.review else "",
                 len(r.evidence),

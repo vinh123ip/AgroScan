@@ -11,10 +11,11 @@ only — saving to SMB with SHA-256 (D-026) comes with the storage layer.
 
 from collections import deque
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPen, QPixmap
+from PySide6.QtCore import QBuffer, QIODevice, Qt, QTimer, Signal
+from PySide6.QtGui import QColor, QFont, QImage, QImageReader, QKeySequence, QPainter, QPen, QPixmap, QShortcut
 from PySide6.QtMultimedia import (
     QCamera,
     QCameraDevice,
@@ -24,6 +25,8 @@ from PySide6.QtMultimedia import (
 )
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
+    QApplication,
+    QCheckBox,
     QComboBox,
     QFileDialog,
     QFrame,
@@ -32,6 +35,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QScrollArea,
     QStackedWidget,
@@ -40,16 +44,22 @@ from PySide6.QtWidgets import (
 )
 
 from agroscan.models.inspection_models import (
+    AuditEvent,
     DetectedUnit,
+    BoxCoverageStatus,
+    BoxZone,
     DetectionResult,
     EvidenceImage,
     InspectionRecord,
     InspectionSession,
+    REQUIRED_COVERAGE_ZONES,
+    compute_box_coverage,
 )
 from agroscan.models.vlm_models import VlmAnalysis
 from agroscan.services import mock_ai, rule_engine, vlm_client
 from agroscan.services.app_settings import AppSettings
-from agroscan.services.evidence_service import capture_and_save_evidence
+from agroscan.services.evidence_service import capture_and_save_evidence, load_evidence_qimage
+from agroscan.services.i18n import language_manager, tr
 from agroscan.services.yolo_engine import (
     YoloEngine,
     YoloInferenceOutput,
@@ -70,24 +80,26 @@ class LiveInspectionPage(QWidget):
 
     _REALTIME_INTERVAL_MS = 400
     _SMOOTHING_FRAMES     = 5
-    _DEEP_ANALYSIS_MS     = 1500
 
-    def __init__(self, settings: AppSettings, parent: Optional[QWidget] = None) -> None:
+    def __init__(self, settings: AppSettings, parent: Optional[QWidget] = None, *, demo: bool = False) -> None:
         super().__init__(parent)
         self.setObjectName("LiveInspectionPage")
         self._settings = settings
+        self._demo = demo
 
         self._session: Optional[InspectionSession] = None
         self._evidence: list[EvidenceImage] = []
         self._images: list[QImage] = []
         self._detection: Optional[DetectionResult] = None
         self._deep_analysis: Optional[VlmAnalysis] = None
+        self._session_audit: list[AuditEvent] = []
         self._analysis_token = 0
         self._is_analyzing = False
         self._frame_history: dict[str, deque] = {}
 
         # Simulation feed state (D-031)
         self._is_sim_mode: bool = False
+        self._custom_original: Optional[tuple[bytes, str]] = None
         self._custom_sim_image: Optional[QImage] = None
         self._current_raw_sim_image: Optional[QImage] = None
         self._current_sim_image: Optional[QImage] = None
@@ -122,11 +134,11 @@ class LiveInspectionPage(QWidget):
         header = QHBoxLayout()
         title_col = QVBoxLayout()
         title_col.setSpacing(6)
-        title = QLabel("Live Inspection")
-        title.setObjectName("PageTitleSmall")
+        self.page_title_label = QLabel(tr("live.title"))
+        self.page_title_label.setObjectName("PageTitleSmall")
         self.session_label = QLabel("No active session")
         self.session_label.setObjectName("PageSubtitle")
-        title_col.addWidget(title)
+        title_col.addWidget(self.page_title_label)
         title_col.addWidget(self.session_label)
         header.addLayout(title_col, 1)
         self.status_badge = StatusBadge()
@@ -251,26 +263,70 @@ class LiveInspectionPage(QWidget):
         self.camera_label = QLabel("")
         self.camera_label.setObjectName("HintLabel")
         controls.addWidget(self.camera_label, 1)
-        self.btn_deep = QPushButton("Deep Analysis (Qwen-VL)")
+        self.btn_deep = QPushButton(tr("live.deep_btn"))
         self.btn_deep.setObjectName("SecondaryButton")
-        self.btn_capture = QPushButton("●  Capture Evidence")
+        self.btn_capture = QPushButton(tr("live.capture_btn"))
         self.btn_capture.setObjectName("PrimaryButton")
-        for btn, width in ((self.btn_deep, 220), (self.btn_capture, 200)):
+        self.btn_import = QPushButton(tr("live.import"))
+        self.btn_import.clicked.connect(self._import_original)
+        for btn, width in ((self.btn_deep, 160), (self.btn_import, 130), (self.btn_capture, 160)):
             btn.setFixedHeight(44)
             btn.setMinimumWidth(width)
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
             controls.addWidget(btn)
         column.addLayout(controls)
 
+        # Whole-Box Coverage Panel (3.4.5.1)
+        self.coverage_card = SectionCard(tr("live.coverage.title"))
+        cov_top = QHBoxLayout()
+        cov_top.setSpacing(10)
+        self.side_label = QLabel(tr("live.coverage.active_side"))
+        self.side_label.setObjectName("FormLabel")
+        self.zone_combo = QComboBox()
+        self.zone_combo.setObjectName("FormCombo")
+        self.zone_combo.setFixedWidth(185)
+        for z in BoxZone:
+            self.zone_combo.addItem(tr(f"zone.{z.value}"), userData=z)
+        self.auto_advance_check = QCheckBox(tr("live.coverage.auto_advance"))
+        self.auto_advance_check.setChecked(True)
+        self.coverage_status_label = QLabel("")
+        self.coverage_status_label.setObjectName("HintLabel")
+        cov_top.addWidget(self.side_label)
+        cov_top.addWidget(self.zone_combo)
+        cov_top.addWidget(self.auto_advance_check)
+        cov_top.addStretch()
+        cov_top.addWidget(self.coverage_status_label)
+        self.coverage_card.body.addLayout(cov_top)
+
+        self.coverage_bar = QProgressBar()
+        self.coverage_bar.setObjectName("CoverageProgressBar")
+        self.coverage_bar.setRange(0, 100)
+        self.coverage_bar.setValue(0)
+        self.coverage_bar.setTextVisible(False)
+        self.coverage_card.body.addWidget(self.coverage_bar)
+
+        pills_row = QHBoxLayout()
+        pills_row.setSpacing(8)
+        self._zone_pills: dict[BoxZone, QLabel] = {}
+        for z in BoxZone:
+            pill = QLabel("")
+            pill.setObjectName("CoveragePill")
+            pill.setProperty("covered", "false")
+            pills_row.addWidget(pill)
+            self._zone_pills[z] = pill
+        pills_row.addStretch()
+        self.coverage_card.body.addLayout(pills_row)
+        column.addWidget(self.coverage_card)
+
         evidence_card = SectionCard("Evidence Images")
         self.evidence_strip = EvidenceStrip()
         evidence_card.body.addWidget(self.evidence_strip)
         evidence_card.body.addWidget(make_hint(
             "Official results are computed from captured still images, not from the live "
-            "video. Auto-capture when the box is steady arrives with YOLO integration; "
-            "use manual capture for now."
+            "video. View tags track camera angles. Confirm that all contents are visible in the count image before submission."
         ))
         column.addWidget(evidence_card)
+        self._refresh_coverage_ui()
         return column
 
     def _build_side_panel(self) -> QWidget:
@@ -373,6 +429,88 @@ class LiveInspectionPage(QWidget):
         self.btn_discard.clicked.connect(self._on_discard)
         self.next_scan_field.returnPressed.connect(self._on_next_scanned)
         self.next_scan_field.textEdited.connect(lambda: self.error_label.setVisible(False))
+        self._capture_shortcut = QShortcut(QKeySequence("F5"), self)
+        self._capture_shortcut.activated.connect(self._on_capture)
+        language_manager().language_changed.connect(self.retranslate_ui)
+
+    def retranslate_ui(self, _lang: str = "") -> None:
+        self.page_title_label.setText(tr("live.title"))
+        self.btn_import.setText(tr("live.import"))
+        self.btn_capture.setText(tr("live.capture_btn"))
+        if not self._is_analyzing:
+            self.btn_deep.setText(tr("live.deep_btn"))
+        self.btn_finish.setText(tr("live.finish_btn"))
+        self.btn_discard.setText(tr("live.discard_btn"))
+        self.side_label.setText(tr("live.coverage.active_side"))
+        self.auto_advance_check.setText(tr("live.coverage.auto_advance"))
+        current_zone = self.zone_combo.currentData()
+        self.zone_combo.blockSignals(True)
+        for idx, z in enumerate(BoxZone):
+            self.zone_combo.setItemText(idx, tr(f"zone.{z.value}"))
+        if current_zone is not None:
+            pos = self.zone_combo.findData(current_zone)
+            if pos >= 0:
+                self.zone_combo.setCurrentIndex(pos)
+        self.zone_combo.blockSignals(False)
+        self._refresh_coverage_ui()
+
+    @property
+    def coverage_status(self) -> BoxCoverageStatus:
+        """Return current Whole-Box Coverage summary for the active session (3.4.5.1)."""
+        return compute_box_coverage(self._evidence)
+
+    @property
+    def is_coverage_complete(self) -> bool:
+        return self.coverage_status.is_complete
+
+    def current_capture_zone(self) -> BoxZone:
+        data = self.zone_combo.currentData()
+        return data if isinstance(data, BoxZone) else BoxZone.TOP
+
+    def set_capture_zone(self, zone: BoxZone) -> None:
+        idx = self.zone_combo.findData(zone)
+        if idx >= 0:
+            self.zone_combo.setCurrentIndex(idx)
+
+    def _refresh_coverage_ui(self) -> None:
+        cov = self.coverage_status
+        pct = int(round(cov.percentage))
+        self.coverage_bar.setValue(pct)
+        self.coverage_bar.setProperty("complete", "true" if cov.is_complete else "false")
+        self.coverage_bar.style().unpolish(self.coverage_bar)
+        self.coverage_bar.style().polish(self.coverage_bar)
+
+        if cov.is_complete:
+            self.coverage_status_label.setText(
+                tr("live.coverage.complete", covered=cov.covered_required, total=len(cov.required_zones))
+            )
+        else:
+            missing_text = ", ".join(tr(f"zone.short.{z.value}") for z in cov.missing_zones)
+            self.coverage_status_label.setText(
+                tr(
+                    "live.coverage.incomplete",
+                    pct=pct,
+                    covered=cov.covered_required,
+                    total=len(cov.required_zones),
+                    missing=missing_text,
+                )
+            )
+
+        for z, pill in self._zone_pills.items():
+            covered = z in cov.captured_zones
+            is_req = z in REQUIRED_COVERAGE_ZONES
+            prefix = "✔ " if covered else ("○ " if is_req else "+ ")
+            pill.setText(f"{prefix}{tr(f'zone.short.{z.value}')}")
+            pill.setProperty("covered", "true" if covered else "false")
+            pill.style().unpolish(pill)
+            pill.style().polish(pill)
+
+    def _advance_to_next_uncovered_zone(self) -> None:
+        if not self.auto_advance_check.isChecked():
+            return
+        missing = self.coverage_status.missing_zones
+        if missing:
+            self.set_capture_zone(missing[0])
 
     # ------------------------------------------------------------------
     # Public API
@@ -390,9 +528,20 @@ class LiveInspectionPage(QWidget):
         self._session = session
         self._evidence, self._images = [], []
         self._detection, self._deep_analysis = None, None
+        self._session_audit = [
+            AuditEvent(
+                action="Session Created",
+                actor=session.inspector,
+                role="Inspector",
+                timestamp=session.started_at,
+                details=f"Box {session.box_code.text} at {session.station}",
+            )
+        ]
         self._analysis_token += 1
         self._is_analyzing = False
-        self.btn_deep.setText("Deep Analysis (Qwen-VL)")
+        self.btn_deep.setText(tr("live.deep_btn"))
+        self.set_capture_zone(BoxZone.TOP)
+        self._refresh_coverage_ui()
         self._frame_history = {
             cls: deque(maxlen=self._SMOOTHING_FRAMES) for cls in session.product.detect_classes
         }
@@ -429,20 +578,41 @@ class LiveInspectionPage(QWidget):
         """Đóng phiên hiện tại thành InspectionRecord; None nếu chưa có ảnh bằng chứng."""
         if self._session is None or not self._evidence or self._detection is None:
             return None
+        assessment = rule_engine.assess_quality(self._session.product, self._detection)
+        audit = list(self._session_audit)
+        audit.append(
+            AuditEvent(
+                action="Assessment Prepared",
+                actor=self._session.inspector,
+                role="Inspector",
+                timestamp=datetime.now(),
+                details=(
+                    f"AI recommendation: {assessment.recommendation.value} · "
+                    f"coverage {self.coverage_status.percentage:.0f}%"
+                ),
+            )
+        )
         record = InspectionRecord(
             session=self._session,
             evidence=list(self._evidence),
             detection=self._detection,
-            assessment=rule_engine.assess_quality(self._session.product, self._detection),
+            assessment=assessment,
             deep_analysis=self._deep_analysis,
+            audit_trail=audit,
         )
         return record
 
     def clear_session(self) -> None:
         self._session = None
+        self._evidence.clear()
+        self._images.clear()
+        self._session_audit.clear()
+        self._detection = self._deep_analysis = None
+        self.evidence_strip.set_evidence([])
+        self._refresh_coverage_ui()
         self._analysis_token += 1
         self._is_analyzing = False
-        self.btn_deep.setText("Deep Analysis (Qwen-VL)")
+        self.btn_deep.setText(tr("live.deep_btn"))
         self.vlm_panel.set_idle()
         self._stop_camera()
         self.session_label.setText("No active session")
@@ -589,7 +759,14 @@ class LiveInspectionPage(QWidget):
             self._yolo_worker.submit_frame(self._current_raw_sim_image, track=True)
             return
 
-        scenario = self.sim_sample_combo.currentData() if self._is_sim_mode else None
+        if not self._is_sim_mode:
+            frame = self.video_widget.videoSink().videoFrame()
+            if frame.isValid() and self._yolo_engine.is_loaded:
+                self._yolo_worker.submit_frame(frame.toImage(), track=True)
+            return
+        scenario = self.sim_sample_combo.currentData()
+        if scenario == "custom":
+            return
         if scenario == "rotten":
             counts = {"fresh": 17, "bruised": 2, "rotten": 1}
         elif scenario == "bruised":
@@ -609,9 +786,10 @@ class LiveInspectionPage(QWidget):
         if self._is_sim_mode:
             if self._current_raw_sim_image is None:
                 self._update_sim_frame()
-            raw_frame = self._current_raw_sim_image or self._current_sim_image
+            raw_frame = self._current_raw_sim_image
             if raw_frame is not None:
-                self._on_image_captured(0, raw_frame)
+                self._capture_evidence(raw_frame, "imported_image", True,
+                                       self._custom_original if self.sim_sample_combo.currentData() == "custom" else None)
             return
 
         if not self._camera_active():
@@ -623,24 +801,32 @@ class LiveInspectionPage(QWidget):
         self._image_capture.capture()
 
     def _on_image_captured(self, _request_id: int, image: QImage) -> None:
+        self._capture_evidence(image, "camera", False)
+
+    def _capture_evidence(self, image: QImage, source: str, demo: bool,
+                          original: Optional[tuple[bytes, str]] = None) -> None:
         if self._session is None:
             return
 
-        # T1.6 / D-026: Hash SHA-256 on raw image bytes and save to disk BEFORE drawing boxes
+        # T1.6 / D-026 / 3.4.5.1: Hash SHA-256 on raw image bytes and tag box surface zone
+        zone = self.current_capture_zone()
         try:
             item = capture_and_save_evidence(
-                raw_image=image,
+                raw_image=original[0] if original else image,
+                image_format=original[1] if original else "PNG",
                 session_id=self._session.session_id,
                 sequence=len(self._evidence) + 1,
                 is_auto_capture=False,
                 settings=self._settings,
+                zone=zone,
             )
-        except Exception:
-            item = EvidenceImage(captured_at=datetime.now(), is_auto_capture=False)
+        except (OSError, ValueError, RuntimeError) as exc:
+            self.show_error(f"Could not save original evidence: {exc}")
+            return
 
         item.width_px, item.height_px = image.width(), image.height()
-        item.source_kind = "imported_image" if self._is_sim_mode else "camera"
-        item.demo_image = self._is_sim_mode and self.sim_sample_combo.currentData() != "custom"
+        item.source_kind = source
+        item.demo_image = demo
         display_image = image
         if self._yolo_engine.is_loaded:
             yolo_out = self._yolo_engine.infer(image, track=True)
@@ -657,13 +843,29 @@ class LiveInspectionPage(QWidget):
                     fps_text=f"ONNX · {yolo_out.inference_ms:.1f} ms",
                 )
             else:
-                self._detection = self._fallback_detection()
+                self._detection = self._fallback_detection() if item.demo_image else yolo_out.detection
         else:
-            self._detection = self._fallback_detection()
+            self._detection = self._fallback_detection() if item.demo_image else DetectionResult(0, {}, 0.0)
 
+        self._analysis_token += 1
+        self._is_analyzing = False
+        self._deep_analysis = None
+        self.vlm_panel.set_idle()
+        self.btn_deep.setText(tr("live.deep_btn"))
         self._evidence.append(item)
         self._images.append(display_image)
         self.evidence_strip.add_thumbnail(item, display_image)
+        self._session_audit.append(
+            AuditEvent(
+                action=f"Evidence Captured ({zone.value.upper()})",
+                actor=self._session.inspector,
+                role="Inspector",
+                timestamp=item.captured_at,
+                details=f"SHA-256: {item.sha256[:12]}…" if item.sha256 else "In-memory capture",
+            )
+        )
+        self._refresh_coverage_ui()
+        self._advance_to_next_uncovered_zone()
 
         low_confidence = self._detection.mean_confidence < self._session.product.min_confidence
         self.deep_suggestion.setVisible(low_confidence)
@@ -694,38 +896,39 @@ class LiveInspectionPage(QWidget):
         self.btn_deep.setEnabled(False)
         self.btn_deep.setText("Analyzing…")
         self.vlm_panel.set_loading()
-        QTimer.singleShot(self._DEEP_ANALYSIS_MS, lambda: self._on_deep_analysis_done(token))
+        original = load_evidence_qimage(self._evidence[-1], settings=self._settings)
+        if original is None:
+            self._on_cancel_deep_analysis()
+            self.show_error("Original evidence is unavailable. Capture again.")
+            return
+        app = QApplication.instance()
+        worker = vlm_client.VlmAnalysisThread(app)
+        worker.analysis_completed.connect(self._on_deep_analysis_done)
+        worker.finished.connect(worker.deleteLater)
+        app.aboutToQuit.connect(worker.wait)
+        worker.start_request(token, self._session, self._detection, original, self._settings,
+                             self.scenario_combo.currentData() if self._demo else None,
+                             fallback_to_mock=self._demo)
 
     def _on_cancel_deep_analysis(self) -> None:
         self._analysis_token += 1          # Late response is ignored (token mismatch)
         self._is_analyzing = False
-        self.btn_deep.setText("Deep Analysis (Qwen-VL)")
+        self.btn_deep.setText(tr("live.deep_btn"))
         self._update_buttons()
         if self._deep_analysis is not None:
             self.vlm_panel.set_analysis(self._deep_analysis, self._expected_label_values())
         else:
             self.vlm_panel.set_idle("Deep analysis cancelled. Press Deep Analysis to try again.")
 
-    def _on_deep_analysis_done(self, token: int) -> None:
+    def _on_deep_analysis_done(self, token: int, result: VlmAnalysis) -> None:
         if token != self._analysis_token:
             return                         # Cancelled or superseded
         self._is_analyzing = False
-        self.btn_deep.setText("Deep Analysis (Qwen-VL)")
+        self.btn_deep.setText(tr("live.deep_btn"))
         self._update_buttons()
         if self._session is None or self._detection is None:
             return
-        last_img = self._images[-1] if self._images else None
-        result = vlm_client.request_deep_analysis(
-            session=self._session,
-            detection=self._detection,
-            image=last_img,
-            settings=self._settings,
-            scenario=self.scenario_combo.currentData(),
-            timeout_s=min(1.5, float(self._settings.load().ai_timeout_s)),
-            fallback_to_mock=True,
-        )
-        if not result.is_error:
-            self._deep_analysis = result   # Errors are shown but never stored in the record
+        self._deep_analysis = None if result.is_error else result
         self.vlm_panel.set_analysis(result, self._expected_label_values())
 
     def _expected_label_values(self) -> dict[str, str]:
@@ -772,6 +975,7 @@ class LiveInspectionPage(QWidget):
     def _update_buttons(self) -> None:
         has_session = self._session is not None
         can_capture = self._camera_active() or self._is_sim_mode
+        self.btn_import.setEnabled(has_session)
         self.btn_capture.setEnabled(has_session and can_capture)
         self.btn_deep.setEnabled(
             has_session and self._detection is not None and not self._is_analyzing
@@ -806,24 +1010,53 @@ class LiveInspectionPage(QWidget):
         else:
             self._update_sim_frame()
 
-    def _on_browse_custom_image(self) -> None:
+    def _select_original(self) -> Optional[tuple[QImage, bytes, str]]:
         path, _ = QFileDialog.getOpenFileName(
             self,
             "Select Inspection Sample Image",
             "",
             "Images (*.png *.jpg *.jpeg *.bmp *.webp)",
         )
-        if path:
-            loaded = QImage(path)
-            if not loaded.isNull():
-                self._custom_sim_image = loaded
-                self._update_sim_frame()
-            else:
-                self.show_error("Could not load the selected image file.")
+        if not path:
+            return None
+        try:
+            data = Path(path).read_bytes()
+            buffer = QBuffer()
+            buffer.setData(data)
+            buffer.open(QIODevice.OpenModeFlag.ReadOnly)
+            reader = QImageReader(buffer)
+            fmt = bytes(reader.format()).decode("ascii").lower()
+            image = reader.read()
+            if fmt not in {"png", "jpeg", "jpg", "bmp", "webp"} or image.isNull():
+                raise ValueError("Select a readable PNG, JPEG, BMP or WebP file.")
+        except (OSError, ValueError) as exc:
+            self.show_error(str(exc))
+            return None
+        return image, data, fmt
+
+    def _import_original(self) -> None:
+        if self._session is not None:
+            result = self._select_original()
+            if result:
+                image, data, fmt = result
+                self._capture_evidence(image, "imported_image", False, (data, fmt))
+
+    def _on_browse_custom_image(self) -> None:
+        result = self._select_original()
+        self._custom_sim_image = None
+        self._custom_original = None
+        if result:
+            self._custom_sim_image, data, fmt = result
+            self._custom_original = (data, fmt)
+        self._update_sim_frame()
 
     def _update_sim_frame(self) -> None:
         scenario = self.sim_sample_combo.currentData() or "fresh"
-        if scenario == "custom" and self._custom_sim_image is not None:
+        if scenario == "custom":
+            if self._custom_sim_image is None:
+                self._current_raw_sim_image = self._current_sim_image = None
+                self.sim_frame_label.clear()
+                return
             raw_img = self._custom_sim_image
         else:
             raw_img = self._render_raw_sim_image(scenario)

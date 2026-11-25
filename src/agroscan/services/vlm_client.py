@@ -10,7 +10,6 @@ Supports:
 from __future__ import annotations
 
 import base64
-from datetime import datetime
 import json
 import socket
 import time
@@ -25,6 +24,7 @@ from PySide6.QtGui import QImage
 from agroscan.models.inspection_models import DetectionResult, InspectionSession
 from agroscan.models.vlm_models import (
     SCHEMA_VERSION,
+    model_analysis,
     VlmAnalysis,
     VlmErrorCode,
     VlmSchemaError,
@@ -101,7 +101,8 @@ def request_deep_analysis(
         # Direct call to LM Studio /v1/chat/completions
         prompt = (
             "Return ONLY a JSON object with fields: defects (list),observations (list of str), "
-            "assessment (str), suggestion (str). "
+            "assessment (str), suggestion (str), ocr ({readable, fields, raw_text}), "
+            "uncertainty ({level, score, reasons}). Use English and report only visible evidence. "
             f"Context: Box={session.box_code.text}, Product={session.product.name}, "
             f"Supplier={session.order.supplier}, Counts={detection.class_counts}."
         )
@@ -176,25 +177,16 @@ def request_deep_analysis(
             request_id=req_id,
         )
 
-    # If talking directly to LM Studio OpenAI format, wrap into schema 1.0
-    if is_openai_chat and isinstance(decoded, dict) and "choices" in decoded:
-        latency_ms = max(1, int((time.perf_counter() - started) * 1000))
-        msg_text = (
-            decoded.get("choices", [{}])[0]
-            .get("message", {})
-            .get("content", "")
-        )
-        base = mock_ai.simulate_deep_analysis(session, detection).to_dict()
-        base["request_id"] = req_id
-        base["model"] = str(decoded.get("model") or "Qwen-VL-LMStudio")
-        base["latency_ms"] = latency_ms
-        base["analyzed_at"] = datetime.now().isoformat(timespec="seconds")
-        if isinstance(msg_text, str) and msg_text.strip():
-            base["assessment"] = msg_text.strip()[:400]
-        decoded = base
-
     try:
-        analysis = parse_vlm_response(decoded)
+        if is_openai_chat:
+            try:
+                findings = json.loads(decoded["choices"][0]["message"]["content"])
+            except (KeyError, IndexError, TypeError, ValueError):
+                raise VlmSchemaError("Missing or invalid model JSON.") from None
+            analysis = model_analysis(findings, req_id, str(decoded.get("model") or "Qwen-VL"),
+                                      max(1, int((time.perf_counter() - started) * 1000)))
+        else:
+            analysis = parse_vlm_response(decoded)
         analysis.is_simulated = False
         return analysis
     except VlmSchemaError as exc:
@@ -217,7 +209,8 @@ class VlmAnalysisThread(QThread):
         self._session: Optional[InspectionSession] = None
         self._detection: Optional[DetectionResult] = None
         self._image: Optional[QImage] = None
-        self._settings: Optional[AppSettings] = None
+        self._settings: Optional[ConnectionSettings] = None
+        self._fallback_to_mock = False
         self._scenario: Optional[mock_ai.VlmScenario] = None
 
     def start_request(
@@ -228,19 +221,21 @@ class VlmAnalysisThread(QThread):
         image: Optional[QImage],
         settings: AppSettings,
         scenario: Optional[mock_ai.VlmScenario] = None,
+        *, fallback_to_mock: bool = True,
     ) -> None:
         if self.isRunning():
-            self.wait(300)
+            raise RuntimeError("An analysis request is already running.")
         self._token = token
         self._session = session
         self._detection = detection
         self._image = image.copy() if image is not None and not image.isNull() else None
-        self._settings = settings
+        self._settings = settings.load()
+        self._fallback_to_mock = fallback_to_mock
         self._scenario = scenario
         self.start()
 
     def run(self) -> None:
-        if self._session is None or self._detection is None:
+        if self._session is None or self._detection is None or self._settings is None:
             return
         result = request_deep_analysis(
             session=self._session,
@@ -248,6 +243,7 @@ class VlmAnalysisThread(QThread):
             image=self._image,
             settings=self._settings,
             scenario=self._scenario,
-            fallback_to_mock=True,
+            timeout_s=min(1.5, self._settings.ai_timeout_s) if self._fallback_to_mock else self._settings.ai_timeout_s,
+            fallback_to_mock=self._fallback_to_mock,
         )
         self.analysis_completed.emit(self._token, result)

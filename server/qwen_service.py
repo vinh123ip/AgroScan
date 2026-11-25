@@ -6,8 +6,7 @@ Runs a lightweight multithreaded HTTP REST server on the PC/workstation
   - ``POST /api/v1/vlm/analyze``  : accepts base64 evidence image + inspection context,
                                     queries upstream LM Studio (OpenAI Vision API at
                                     ``http://127.0.0.1:1234/v1/chat/completions``) when
-                                    online, or synthesizes a schema-1.0 compliant analysis
-                                    from image metrics + YOLO counts when LM Studio is offline.
+                                    online, and returns a structured error when inference is unavailable.
 
 Every response strictly conforms to ``agroscan.models.vlm_models.VLM_JSON_SCHEMA`` (v1.0).
 """
@@ -35,9 +34,10 @@ if str(SRC_DIR) not in sys.path:
 
 from agroscan.models.vlm_models import (  # noqa: E402
     SCHEMA_VERSION,
+    VlmAnalysis,
+    model_analysis,
     VlmErrorCode,
     VlmSchemaError,
-    parse_vlm_response,
 )
 
 DEFAULT_HOST = os.environ.get("AGROSCAN_VLM_HOST", "0.0.0.0")
@@ -150,7 +150,6 @@ def build_vlm_response(
     class_counts: dict[str, int] = {
         str(k): int(v) for k, v in dict(detection.get("class_counts") or {}).items()
     }
-    mean_conf = float(detection.get("mean_confidence") or 0.88)
 
     # Check if caller explicitly asked to simulate a server error code
     force_error = request_data.get("force_error")
@@ -177,10 +176,13 @@ def build_vlm_response(
             },
         }
 
-    # Verify image bytes if provided
+    if not image_b64:
+        return VlmAnalysis.client_error(VlmErrorCode.IMAGE_UNUSABLE, "An original image is required.",
+                                        retryable=False, request_id=req_id).to_dict()
+    # Verify image bytes before contacting the model.
     if image_b64:
         try:
-            raw_bytes = base64.b64decode(image_b64, validate=False)
+            raw_bytes = base64.b64decode(image_b64, validate=True)
             if len(raw_bytes) < 32:
                 raise ValueError("Image payload too small")
         except Exception as exc:
@@ -219,117 +221,17 @@ def build_vlm_response(
         model_name=model_name,
     )
 
-    # 2. Build deterministic schema-1.0 structure (enriched by LM Studio if available)
-    rotten_count = int(class_counts.get("rotten", 0))
-    bruised_count = int(class_counts.get("bruised", 0))
-    fresh_count = int(class_counts.get("fresh", 0))
-    total_count = max(1, rotten_count + bruised_count + fresh_count)
-
-    defects: list[dict[str, Any]] = []
-    if rotten_count > 0:
-        defects.append(
-            {
-                "defect_class": "rotten",
-                "count": rotten_count,
-                "severity": "critical",
-                "confidence": round(min(0.99, max(0.82, mean_conf)), 2),
-                "description": (
-                    f"Detected {rotten_count} unit(s) showing severe fungal decay and tissue breakdown."
-                ),
-                "region": [0.35, 0.40, 0.25, 0.28],
-            }
-        )
-    if bruised_count > 0:
-        sev = "major" if (bruised_count / total_count) > 0.10 else "minor"
-        defects.append(
-            {
-                "defect_class": "bruised",
-                "count": bruised_count,
-                "severity": sev,
-                "confidence": round(min(0.98, max(0.75, mean_conf - 0.03)), 2),
-                "description": (
-                    f"Observed {bruised_count} unit(s) with mechanical compression marks on the peel."
-                ),
-                "region": [0.18, 0.22, 0.22, 0.24],
-            }
-        )
-
-    if rotten_count > 0:
-        observations = [
-            f"Critical decay detected on {rotten_count} {product_name.lower()} specimen(s).",
-            f"Remaining {fresh_count} specimen(s) appear intact but risk cross-contamination.",
-        ]
-        assessment = (
-            f"Box {box_code} fails hygiene threshold due to critical rot presence ({rotten_count} rotten)."
-        )
-        suggestion = "Reject box immediately or isolate rotten units before secondary review."
-        u_level, u_score, u_reasons = "low", 0.12, []
-    elif (bruised_count / total_count) > 0.10:
-        observations = [
-            f"Surface bruising ratio is {bruised_count}/{total_count} ({bruised_count / total_count:.1%}).",
-            "No active mold or liquid leakage observed inside the crate.",
-        ]
-        assessment = (
-            f"Bruising ratio exceeds standard tolerance for {product_name}; manual grading advised."
-        )
-        suggestion = "Route to Reviewer for downgrade or partial lot rejection."
-        u_level, u_score, u_reasons = "medium", 0.34, ["Borderline bruise depth under top lighting."]
-    else:
-        observations = [
-            f"Uniform color and firm skin across {fresh_count} {product_name.lower()} unit(s).",
-            "Minor superficial handling marks are within acceptable commercial grade.",
-        ]
-        assessment = f"Box {box_code} meets visual quality criteria with no critical defects."
-        suggestion = "Approve box (Pass)."
-        u_level, u_score, u_reasons = "low", 0.09, []
-
-    if isinstance(lm_raw, dict):
-        if isinstance(lm_raw.get("assessment"), str) and lm_raw["assessment"].strip():
-            assessment = lm_raw["assessment"].strip()
-        if isinstance(lm_raw.get("suggestion"), str) and lm_raw["suggestion"].strip():
-            suggestion = lm_raw["suggestion"].strip()
-        if isinstance(lm_raw.get("observations"), list) and lm_raw["observations"]:
-            obs = [str(x) for x in lm_raw["observations"] if isinstance(x, str)]
-            if obs:
-                observations = obs
-
-    latency_ms = max(1, int((time.perf_counter() - started) * 1000))
-    response_payload: dict[str, Any] = {
-        "schema_version": SCHEMA_VERSION,
-        "request_id": req_id,
-        "status": "ok",
-        "model": model_name,
-        "latency_ms": latency_ms,
-        "analyzed_at": datetime.now().isoformat(timespec="seconds"),
-        "defects": defects,
-        "ocr": {
-            "readable": True,
-            "fields": [
-                {"key": "box_code", "value": box_code, "confidence": 0.97},
-                {"key": "supplier", "value": supplier, "confidence": 0.94},
-                {
-                    "key": "packed_date",
-                    "value": datetime.now().strftime("%Y-%m-%d"),
-                    "confidence": 0.92,
-                },
-            ],
-            "raw_text": f"{box_code} | {supplier} | {product_name}",
-        },
-        "observations": observations,
-        "assessment": assessment,
-        "uncertainty": {
-            "level": u_level,
-            "score": u_score,
-            "reasons": u_reasons,
-        },
-        "suggestion": suggestion,
-        "warnings": [],
-        "error": None,
-    }
-
-    # Validate against schema 1.0 before returning
-    parse_vlm_response(response_payload)
-    return response_payload
+    if lm_raw is None:
+        return VlmAnalysis.client_error(
+            VlmErrorCode.MODEL_ERROR, "The vision model returned no usable analysis.",
+            retryable=True, request_id=req_id,
+        ).to_dict()
+    try:
+        return model_analysis(lm_raw, req_id, model_name,
+                              max(1, int((time.perf_counter() - started) * 1000))).to_dict()
+    except VlmSchemaError as exc:
+        return VlmAnalysis.client_error(VlmErrorCode.INVALID_RESPONSE, str(exc),
+                                        retryable=True, request_id=req_id).to_dict()
 
 
 class QwenVlmRequestHandler(BaseHTTPRequestHandler):
@@ -351,7 +253,7 @@ class QwenVlmRequestHandler(BaseHTTPRequestHandler):
         self.wfile.write(raw)
 
     def do_GET(self) -> None:  # noqa: N802
-        if self.path.startswith(("/", "/health", "/api/v1/health")):
+        if self.path.partition("?")[0] in ("/", "/health", "/api/v1/health"):
             self._send_json(
                 200,
                 {

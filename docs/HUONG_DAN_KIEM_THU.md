@@ -70,3 +70,11 @@ Mở `python run.py --demo` rồi chạy TC01–TC07 theo thứ tự cho một l
 ## Kiểm tra tự động
 
 `python tests/e2e_walkthrough.py` kiểm tra luồng giao diện với dữ liệu mock. `python run_tests.py` chạy bộ test đầy đủ, trong đó có ca đọc seed, nhập đơn, nộp và duyệt kiểm định trong giao dịch được rollback khi kết thúc. Khi chạy bộ đầy đủ, dùng database kiểm thử riêng đã nạp schema và seed, đồng thời trỏ cấu hình kết nối tới database đó. Kết quả cuối cần có `Failures: 0` và `Errors: 0`.
+
+### Kiểm tra bản tích hợp Sprint 3.4 với PostgreSQL v1.2
+
+- Chọn **Import original** để nạp ảnh vận hành. **Simulation Feed** gắn nhãn demo cho cả ảnh tự chọn. Đối chiếu SHA-256 với tệp nhập và thử hủy chọn ảnh. Các góc chụp hỗ trợ quan sát. Khi nộp, Inspector xác nhận ảnh đếm của batch bao quát toàn bộ thùng.
+- Chuyển **EN / VI** giữa phiên, kiểm tra mã thùng, ảnh đã chụp và trạng thái. Xuất báo cáo trong giao diện tiếng Việt rồi kiểm tra cột kết quả trong tệp tiếng Anh.
+- Trên Dashboard đối chiếu số thùng đã duyệt với số vị trí của kế hoạch mẫu hiện hành. Lô chưa khóa kế hoạch hiển thị dấu gạch ngang. Với lô mực mẫu, kiểm tra hai thùng đã duyệt, attempt tái kiểm cũ và quyết định chấp thuận ngoại lệ.
+- Trong History, tìm thùng theo mã rồi mở từng attempt. Reviewer có thể thêm ghi chú. Admin có thể xem nhật ký. Manager có thể tra cứu kết quả. Khi thử trên lô đã ký, đối chiếu phiên bản, lý do ngoại lệ và danh sách attempt trong bản kê trước và sau khi ghi chú.
+- Kiểm tra Qwen-VL vận hành bằng một ảnh gốc và một endpoint đã nạp mô hình. Test tự động chạy giao tiếp HTTP với đầu ra mô hình kiểm soát được. Kiểm tra SMB và suy luận trên máy chủ triển khai là hai phép thử riêng.

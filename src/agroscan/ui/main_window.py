@@ -25,6 +25,7 @@ from agroscan.models.inspection_models import (
     Order,
 )
 from agroscan.models.user_models import AuthSession, User
+from agroscan.services.i18n import language_manager, set_language, tr
 from agroscan.services.app_settings import AppSettings
 from agroscan.services.evidence_service import configure_evidence_storage
 from agroscan.services.mock_auth import MockAuthService
@@ -113,6 +114,7 @@ class MainWindow(QMainWindow):
         self._auth = auth_service
         self._repo = repo
         self._settings = settings or AppSettings()
+        set_language(self._settings.load().language)
         configure_evidence_storage(self._settings)
         if auth_session is not None:
             self._auth_session = auth_session
@@ -144,6 +146,8 @@ class MainWindow(QMainWindow):
 
         self._init_ui()
         self._connect_signals()
+        language_manager().language_changed.connect(self._translate_header)
+        self._translate_header()
         self._session_timer.start()
         self.navigate_to(PageKey.DASHBOARD)
 
@@ -214,10 +218,10 @@ class MainWindow(QMainWindow):
 
         brand = QLabel("AgroScan")
         brand.setObjectName("Brand")
-        brand_subtitle = QLabel("INSPECTION WORKSTATION")
-        brand_subtitle.setObjectName("BrandSubtitle")
+        self.brand_subtitle = QLabel(tr("header.brand_subtitle"))
+        self.brand_subtitle.setObjectName("BrandSubtitle")
         layout.addWidget(brand)
-        layout.addWidget(brand_subtitle)
+        layout.addWidget(self.brand_subtitle)
         layout.addSpacing(20)
 
         self.navigation = QListWidget()
@@ -229,7 +233,7 @@ class MainWindow(QMainWindow):
         self._populate_sidebar()
         layout.addWidget(self.navigation, 1)
 
-        demo_badge = QLabel("DEMO MODE")
+        demo_badge = QLabel("POSTGRESQL" if isinstance(self._repo, PostgresRepository) else "DEMO MODE")
         demo_badge.setObjectName("DemoBadge")
         demo_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(demo_badge)
@@ -243,11 +247,11 @@ class MainWindow(QMainWindow):
         for spec in sidebar_specs(self._user.role):
             if spec.section != current_section:
                 current_section = spec.section
-                header = QListWidgetItem(current_section.value)
+                header = QListWidgetItem(tr(f"nav.section.{current_section.name}"))
                 header.setFlags(Qt.ItemFlag.NoItemFlags)
                 header.setSizeHint(QSize(0, 34))
                 self.navigation.addItem(header)
-            item = QListWidgetItem(spec.label)
+            item = QListWidgetItem(tr(f"nav.page.{spec.key.value}"))
             item.setData(Qt.ItemDataRole.UserRole, spec.key)
             item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
             self.navigation.addItem(item)
@@ -310,9 +314,26 @@ class MainWindow(QMainWindow):
         self.btn_logout.setFixedHeight(36)
         self.btn_logout.setCursor(Qt.CursorShape.PointingHandCursor)
 
-        for widget in (self.session_badge, self.user_label, self.role_badge, self.btn_logout):
+        self.language_button = QPushButton("EN / VI")
+        self.language_button.clicked.connect(self._toggle_language)
+        for widget in (self.language_button, self.session_badge, self.user_label, self.role_badge, self.btn_logout):
             layout.addWidget(widget, alignment=Qt.AlignmentFlag.AlignVCenter)
         return header
+
+    def _toggle_language(self) -> None:
+        cfg = self._settings.load()
+        cfg.language = language_manager().toggle_language()
+        self._settings.save(cfg)
+
+    def _translate_header(self, _language: str = "") -> None:
+        self.brand_subtitle.setText(tr("header.brand_subtitle"))
+        self.session_badge.setText(tr("header.session_active"))
+        self.btn_logout.setText(tr("header.logout"))
+        self.language_button.setToolTip(tr("header.language_tooltip"))
+        self._populate_sidebar()
+        if self._current_key is not None:
+            self._update_breadcrumb(self._current_key)
+            self._sync_sidebar(self._current_key)
 
     def _build_page_stack(self) -> QStackedWidget:
         self.page_stack = QStackedWidget()
@@ -333,13 +354,13 @@ class MainWindow(QMainWindow):
         if key == PageKey.BOX_INTAKE:
             return BoxIntakePage(self._repo)
         if key == PageKey.LIVE_INSPECTION:
-            return LiveInspectionPage(self._settings)
+            return LiveInspectionPage(self._settings, demo=isinstance(self._repo, MockRepository))
         if key == PageKey.ASSESSMENT_RESULT:
             return AssessmentResultPage()
         if key == PageKey.REVIEW_QUEUE:
             return ReviewQueuePage(self._repo, self._user)
         if key == PageKey.INSPECTION_HISTORY:
-            return InspectionHistoryPage(self._repo, self._settings)
+            return InspectionHistoryPage(self._repo, self._settings, current_user=self._user)
         if key == PageKey.REPORTS:
             return ReportsPage(self._repo)
         if key == PageKey.CATALOG:
@@ -491,23 +512,18 @@ class MainWindow(QMainWindow):
 
     def _submit_record(self, record: InspectionRecord, on_error: Optional[Callable[[str], None]] = None) -> bool:
         """Persist AI recommendation and transition the session to Pending Review (D-020)."""
-        postgres = isinstance(self._repo, PostgresRepository)
-        if postgres:
-            answer = QMessageBox.question(
-                self, "Confirm whole-box coverage",
-                "The last captured image must show every distinct item in this box for counting. "
-                "Earlier images will be attached as supporting views of the same batch. "
-                "Does the last image cover the whole box?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
-            )
-            if answer != QMessageBox.StandardButton.Yes:
-                return False
+        answer = QMessageBox.question(
+            self, "Confirm whole-box coverage",
+            "The last captured image must show every distinct item in this box for counting. "
+            "Earlier images will be attached as supporting views of the same batch. "
+            "Does the last image cover the whole box?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return False
         try:
-            if postgres:
-                self._repo.submit_for_review(record, coverage_confirmed=True)
-            else:
-                self._repo.submit_for_review(record)
+            self._repo.submit_for_review(record, coverage_confirmed=True)
         except ValueError as exc:
             if on_error:
                 on_error(str(exc))
@@ -593,8 +609,8 @@ class MainWindow(QMainWindow):
         spec = get_spec(key)
         parts = ["AgroScan"]
         if spec.parent is not None:
-            parts.append(get_spec(spec.parent).label)
-        parts.append(spec.label)
+            parts.append(tr(f"nav.page.{spec.parent.value}"))
+        parts.append(tr(f"nav.page.{key.value}"))
         session = self._active_session()
         text = "  /  ".join(parts)
         if spec.parent is not None and session is not None:

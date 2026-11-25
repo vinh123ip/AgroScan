@@ -25,6 +25,7 @@ class ConnectionSettings:
     storage_path: str = r"\\SERVER_IP\AgroScan_Data"
     camera_id:    str = ""            # Rỗng = camera mặc định của hệ thống
     station_name: str = "STATION-01"
+    language: str = "en"
 
 
 @dataclass

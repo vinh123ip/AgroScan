@@ -503,6 +503,16 @@ def parse_vlm_response(payload: str | bytes | dict) -> VlmAnalysis:
     return analysis
 
 
+def model_analysis(findings: dict, request_id: str, model: str, latency_ms: int) -> VlmAnalysis:
+    """Validate model-authored findings with transport metadata from the workstation."""
+    required = {"defects", "ocr", "observations", "assessment", "uncertainty", "suggestion"}
+    if not isinstance(findings, dict) or not required.issubset(findings):
+        raise VlmSchemaError("The model did not return all required analysis sections.")
+    return parse_vlm_response({
+        **findings, "schema_version": SCHEMA_VERSION, "status": "ok", "request_id": request_id,
+        "model": model, "latency_ms": latency_ms, "analyzed_at": datetime.now().isoformat(),
+    })
+
+
 if __name__ == "__main__":
     print(json.dumps(VLM_JSON_SCHEMA, indent=2, ensure_ascii=False))
-

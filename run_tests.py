@@ -35,7 +35,7 @@ if venv_python.exists() and Path(sys.executable).resolve() != venv_python.resolv
 
 def run_all_tests(verbose: bool = True) -> bool:
     print("=" * 76)
-    print("  AGROSCAN AUTOMATED VERIFICATION SUITE — SPRINT 2 / TASK 3.2.5.7")
+    print("  AGROSCAN WORKSTATION VERIFICATION SUITE")
     print("=" * 76)
     print(f"  Python executable : {sys.executable}")
     print(f"  Working directory : {ROOT_DIR}")
@@ -54,28 +54,22 @@ def run_all_tests(verbose: bool = True) -> bool:
     total = result.testsRun
     failures = len(result.failures)
     errors = len(result.errors)
-    passed = total - failures - errors
+    skipped = len(result.skipped)
+    passed = total - failures - errors - skipped - len(result.unexpectedSuccesses) - len(result.expectedFailures)
 
     print("\n" + "=" * 76)
     print("  AUTOMATED TEST SUMMARY REPORT")
     print("=" * 76)
     print(f"  Total Test Cases Executed : {total}")
     print(f"  Passed                    : {passed} [✔]")
+    print(f"  Skipped                   : {skipped}")
     print(f"  Failures                  : {failures}")
     print(f"  Errors                    : {errors}")
     print(f"  Execution Time            : {elapsed:.2f} seconds")
     print("-" * 76)
 
-    print("  CHECKLIST & DOD VERIFICATION STATUS:")
-    print("  [✔] 1. Login Form & HMAC-SHA256 Bearer Session/Token Management")
-    print("  [✔] 2. Goods Category & Quality Criteria Editor (Search, CRUD, Real-time Conflict Guard)")
-    print("  [✔] 3. QR/Barcode Scanner (ISO/IEC 18004 Engine, 350ms Debounce, Manual Order Lookup)")
-    print("  [✔] 4. Order Info, Lot Size, Declared Category, Criteria Table & 7 Error Classes")
-    print("  [✔] 5. VLM Result Panel (Schema 1.0) & Live Inspection / Detail Integration")
-    print("=" * 76)
-
     if result.wasSuccessful():
-        print("  >>> OVERALL RESULT: ALL TESTS PASSED SUCCESSFULLY! (SCORE: 10/10) <<<")
+        print("  >>> OVERALL RESULT: TEST SUITE COMPLETED SUCCESSFULLY <<<")
         print("=" * 76 + "\n")
         return True
     else:

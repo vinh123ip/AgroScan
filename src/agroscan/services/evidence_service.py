@@ -23,7 +23,7 @@ from typing import Optional, Union
 from PySide6.QtCore import QBuffer, QByteArray, QIODevice
 from PySide6.QtGui import QImage
 
-from agroscan.models.inspection_models import EvidenceImage
+from agroscan.models.inspection_models import BoxZone, EvidenceImage
 from agroscan.services.app_settings import AppSettings, ConnectionSettings
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -142,6 +142,7 @@ def capture_and_save_evidence(
     storage_root: Optional[Union[Path, str]] = None,
     settings: Optional[Union[AppSettings, ConnectionSettings]] = None,
     image_format: str = "PNG",
+    zone: Optional[BoxZone] = None,
 ) -> EvidenceImage:
     """Hash raw image bytes with SHA-256 and write the unannotated file to disk.
 
@@ -188,12 +189,21 @@ def capture_and_save_evidence(
 
     # D-008: Never overwrite an existing evidence file
     collision_idx = 2
-    while abs_path.exists():
-        candidate_name = f"{base_stem}_{collision_idx}.{ext}"
-        abs_path = abs_dir / candidate_name
-        collision_idx += 1
-
-    abs_path.write_bytes(raw_bytes)
+    while True:
+        try:
+            stream = abs_path.open("xb")
+        except FileExistsError:
+            candidate_name = f"{base_stem}_{collision_idx}.{ext}"
+            abs_path = abs_dir / candidate_name
+            collision_idx += 1
+            continue
+        try:
+            with stream:
+                stream.write(raw_bytes)
+        except OSError:
+            abs_path.unlink(missing_ok=True)
+            raise
+        break
 
     rel_posix = (rel_dir / candidate_name).as_posix()
     return EvidenceImage(
@@ -201,6 +211,7 @@ def capture_and_save_evidence(
         is_auto_capture=is_auto_capture,
         relative_path=rel_posix,
         sha256=digest,
+        zone=zone,
     )
 
 

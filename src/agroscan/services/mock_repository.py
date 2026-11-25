@@ -15,7 +15,10 @@ from typing import Optional
 
 from agroscan.models.inspection_models import (
     AiRecommendation,
+    AttributedNote,
+    AuditEvent,
     BoxCode,
+    BoxZone,
     DefectCriterion,
     EvidenceImage,
     InspectionRecord,
@@ -240,16 +243,183 @@ class MockRepository:
         return InspectionSession(session_id, box_code, order, inspector, station)
 
     def records_for_box(self, box_code: BoxCode) -> list[InspectionRecord]:
-        return [r for r in self.records if r.session.box_code == box_code]
+        return sorted(
+            (r for r in self.records if r.session.box_code == box_code),
+            key=lambda r: r.session.started_at,
+        )
 
-    def submit_for_review(self, record: InspectionRecord) -> None:
-        """Lưu kết quả AI, phiên chuyển sang Pending Review (D-020)."""
+    def box_versions(self, box_code: BoxCode) -> list[InspectionRecord]:
+        """Return chronological versioned inspection records (v1, v2, ...) for ``box_code``."""
+        versions = self.records_for_box(box_code)
+        for idx, rec in enumerate(versions, start=1):
+            rec.version = idx
+        return versions
+
+    def _ensure_record_metadata(self, record: InspectionRecord) -> None:
+        session = record.session
+        if not record.audit_trail:
+            record.audit_trail.append(
+                AuditEvent(
+                    action="Session Created",
+                    actor=session.inspector,
+                    role="Inspector",
+                    timestamp=session.started_at,
+                    details=f"Box {session.box_code.text} at {session.station}",
+                )
+            )
+            if record.evidence:
+                zones = ", ".join(sorted({ev.zone.value for ev in record.evidence if ev.zone is not None}))
+                record.audit_trail.append(
+                    AuditEvent(
+                        action="Evidence Captured",
+                        actor=session.inspector,
+                        role="Inspector",
+                        timestamp=record.evidence[-1].captured_at,
+                        details=f"{len(record.evidence)} image(s) [{zones}] · coverage {record.coverage.percentage:.0f}%",
+                    )
+                )
+            if record.deep_analysis is not None:
+                record.audit_trail.append(
+                    AuditEvent(
+                        action="Deep Analysis (Qwen-VL)",
+                        actor=session.inspector,
+                        role="Inspector",
+                        timestamp=record.deep_analysis.analyzed_at,
+                        details=f"Model {record.deep_analysis.model} ({record.deep_analysis.status.value})",
+                    )
+                )
+            record.audit_trail.append(
+                AuditEvent(
+                    action="Submitted for Review",
+                    actor=session.inspector,
+                    role="Inspector",
+                    timestamp=record.evidence[-1].captured_at if record.evidence else session.started_at,
+                    details=f"AI recommendation: {record.assessment.recommendation.value}",
+                )
+            )
+        if session.notes.strip() and not any(
+            n.text == session.notes.strip() and n.author == session.inspector
+            for n in record.attributed_notes
+        ):
+            record.attributed_notes.append(
+                AttributedNote(
+                    author=session.inspector,
+                    role="Inspector",
+                    text=session.notes.strip(),
+                    created_at=session.started_at,
+                    note_id=f"note-{session.session_id}-init",
+                )
+            )
+
+    def submit_for_review(self, record: InspectionRecord, *, coverage_confirmed: bool = False) -> None:
+        if not coverage_confirmed or not record.evidence:
+            raise ValueError("Confirm whole-box coverage before submitting evidence.")
+        existing = next((r for r in self.records if r.session_id == record.session_id), None)
+        if existing:
+            if existing.review:
+                raise ValueError("A reviewed attempt is frozen.")
+            return
+        record.whole_box_confirmed = True
         record.session.status = SessionStatus.PENDING_REVIEW
-        self.records.append(record)
+        prior = self.records_for_box(record.session.box_code)
+        if record not in prior:
+            record.version = len(prior) + 1
+            self._ensure_record_metadata(record)
+            self.records.append(record)
+        else:
+            self._ensure_record_metadata(record)
 
     def apply_review(self, record: InspectionRecord, review: ReviewRecord) -> None:
+        account = next((u for u in self.users if u.username == review.reviewer), None)
+        if not account or not account.is_active or account.role is not Role.REVIEWER:
+            raise ValueError("An active Reviewer is required.")
+        if record.review or record.status is not SessionStatus.PENDING_REVIEW:
+            raise ValueError("This inspection is no longer pending.")
+        if any(r.session.inspector == review.reviewer for r in self.records_for_box(record.session.box_code)):
+            raise ValueError("An independent Reviewer is required.")
         record.review = review
         record.session.status = SessionStatus.COMPLETED
+        record.audit_trail.append(
+            AuditEvent(
+                action=f"Reviewer Decision: {review.decision.value}",
+                actor=review.reviewer,
+                role="Reviewer",
+                timestamp=review.reviewed_at,
+                details=review.notes or f"Marked as {review.decision.value}",
+            )
+        )
+        if review.notes.strip():
+            record.attributed_notes.append(
+                AttributedNote(
+                    author=review.reviewer,
+                    role="Reviewer",
+                    text=review.notes.strip(),
+                    created_at=review.reviewed_at,
+                    note_id=f"note-{record.session_id}-rev-{len(record.attributed_notes) + 1}",
+                )
+            )
+
+    def add_attributed_note(
+        self,
+        session_id: str,
+        author: str,
+        role: str,
+        text: str,
+        created_at: Optional[datetime] = None,
+    ) -> AttributedNote:
+        """Append an attributed note to an existing inspection record (3.4.5.9)."""
+        account = next((user for user in self.users if user.username == author), None)
+        if account is None or not account.is_active or account.role is not Role.REVIEWER:
+            raise ValueError("An active Reviewer is required to append a note.")
+        role = account.role.value
+        cleaned = text.strip()
+        if not cleaned:
+            raise ValueError("Note text cannot be empty.")
+        record = next((r for r in self.records if r.session_id == session_id), None)
+        if record is None:
+            raise ValueError(f"Session '{session_id}' was not found.")
+        ts = created_at or datetime.now()
+        note = AttributedNote(
+            author=author.strip() or "unknown",
+            role=role.strip() or "User",
+            text=cleaned,
+            created_at=ts,
+            note_id=f"note-{session_id}-{len(record.attributed_notes) + 1}",
+        )
+        record.attributed_notes.append(note)
+        record.audit_trail.append(
+            AuditEvent(
+                action="Note Added",
+                actor=note.author,
+                role=note.role,
+                timestamp=ts,
+                details=cleaned[:120],
+            )
+        )
+        return note
+
+    def record_audit_event(
+        self,
+        session_id: str,
+        action: str,
+        actor: str,
+        role: str,
+        details: str = "",
+        timestamp: Optional[datetime] = None,
+    ) -> AuditEvent:
+        """Append a chronological audit event to an existing session (3.4.5.9)."""
+        record = next((r for r in self.records if r.session_id == session_id), None)
+        if record is None:
+            raise ValueError(f"Session '{session_id}' was not found.")
+        event = AuditEvent(
+            action=action,
+            actor=actor,
+            role=role,
+            timestamp=timestamp or datetime.now(),
+            details=details,
+        )
+        record.audit_trail.append(event)
+        return event
 
     def pending_records(self) -> list[InspectionRecord]:
         pending = [r for r in self.records if r.status == SessionStatus.PENDING_REVIEW]
@@ -276,14 +446,20 @@ class MockRepository:
                 record = latest.get(BoxCode(order.order_code, box_no, order.total_boxes))
                 if record is None:
                     summary.remaining += 1
-                elif record.review is None or record.review.decision == ReviewerDecision.RE_INSPECT:
+                elif record.review is None:
                     summary.pending += 1
+                elif record.review.decision == ReviewerDecision.RE_INSPECT:
+                    summary.pending += 1
+                    summary.reinspect += 1
                 elif record.review.decision == ReviewerDecision.PASS:
                     summary.passed += 1
                 else:
                     summary.failed += 1
             summaries.append(summary)
         return summaries
+
+    def sample_progress(self) -> list[OrderSummary]:
+        return self.order_summaries()
 
     def daily_outcomes(
         self, start: date, end: date, product_code: Optional[str] = None
@@ -311,8 +487,10 @@ class MockRepository:
         status: Optional[SessionStatus] = None,
         start: Optional[date] = None,
         end: Optional[date] = None,
+        outcome: Optional[str] = None,
     ) -> list[InspectionRecord]:
         needle = text.strip().upper()
+        outcome_filter = outcome.strip().lower() if outcome else None
         result = []
         for record in self.all_records():
             session = record.session
@@ -327,6 +505,14 @@ class MockRepository:
                 continue
             if end and day > end:
                 continue
+            if outcome_filter:
+                actual = (
+                    record.review.decision.value.lower()
+                    if record.review is not None
+                    else record.assessment.recommendation.value.lower()
+                )
+                if actual != outcome_filter:
+                    continue
             result.append(record)
         return result
 
@@ -377,7 +563,7 @@ class MockRepository:
             assessment,
             deep_analysis=deep_analysis,
         )
-        self.submit_for_review(record)
+        self.submit_for_review(record, coverage_confirmed=True)
         if review:
             decision = {
                 AiRecommendation.PASS: ReviewerDecision.PASS,

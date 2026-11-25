@@ -23,6 +23,7 @@ from PySide6.QtWidgets import QApplication
 from agroscan.models.inspection_models import (
     AiRecommendation,
     BoxCode,
+    BoxZone,
     DetectedUnit,
     DefectCriterion,
     DetectionResult,
@@ -175,6 +176,7 @@ class TestPostgresRepositoryLive(unittest.TestCase):
             original = QImage(12, 12, QImage.Format.Format_RGB32)
             original.fill(0xFFFFFFFF)
             image = capture_and_save_evidence(original, session.session_id, storage_root=tmp)
+            image.zone = BoxZone.LEFT
             image.width_px = image.height_px = 12
             image.model_file = "fruit_defect.onnx"
             image.units = [DetectedUnit(1, 1, 5, 5, "fresh", 0.9)]
@@ -182,12 +184,17 @@ class TestPostgresRepositoryLive(unittest.TestCase):
                 session, [image], DetectionResult(1, {"fresh": 1}, 0.9, False),
                 QualityAssessmentResult(AiRecommendation.NEEDS_REVIEW, [], {}),
             )
+            with self.assertRaisesRegex(ValueError, "Confirm whole-box coverage"):
+                self.repo.submit_for_review(record)
             with patch("agroscan.services.postgres_repository.verify_evidence_integrity", return_value=True):
                 self.repo.submit_for_review(record, coverage_confirmed=True)
                 self.repo.submit_for_review(record, coverage_confirmed=True)
             self.assertEqual(record.status, SessionStatus.PENDING_REVIEW)
             reloaded = next(r for r in self.repo.pending_records() if r.session_id == record.session_id)
             self.assertEqual(reloaded.evidence[0].sha256, image.sha256)
+            self.assertEqual(reloaded.evidence[0].zone, BoxZone.LEFT)
+            self.assertTrue(reloaded.whole_box_confirmed)
+            self.assertFalse(reloaded.coverage.is_complete)
             self.assertEqual(reloaded.detection.total_objects, 1)
             with self.assertRaises(ValueError):
                 self.repo.apply_review(reloaded, ReviewRecord(ReviewerDecision.PASS, maker.username, "Test"))
@@ -195,6 +202,46 @@ class TestPostgresRepositoryLive(unittest.TestCase):
             reread = next(r for r in self.repo.records if r.session_id == record.session_id)
             self.assertEqual(reread.status, SessionStatus.COMPLETED)
             self.assertEqual(reread.review.reviewer, reviewer.username)
+
+    def test_signed_history_note_permissions_and_frozen_manifest(self) -> None:
+        with self.isolated_writes():
+            session_id = "INS--120512"
+            record, = self.repo.filter_records(text=session_id, outcome="Pass")
+            versions = self.repo.box_versions(record.session.box_code)
+            self.assertEqual([r.version for r in versions], [1, 2])
+            self.assertTrue(record.whole_box_confirmed)
+            self.assertEqual(record.session.order.lot_outcome, "approve")
+            self.assertEqual(record.session.order.sampling_recommendation, "reject")
+            self.assertIn(record.session_id, record.session.order.signed_attempts)
+            self.assertNotIn(versions[0].session_id, record.session.order.signed_attempts)
+            self.assertEqual(self.repo.filter_records(text=session_id, outcome="Fail"), [])
+
+            def signed_payload():
+                with self.repo._connection() as conn, conn.cursor() as cur:
+                    cur.execute("""SELECT manifest_bytes,signature FROM agroscan.latest_lot_decisions
+                                   WHERE lot_id=%s""", (record.session.order.lot_id,))
+                    return tuple(bytes(field) for field in cur.fetchone())
+
+            original = signed_payload()
+            reviewer = self.repo.save_user("review-" + uuid4().hex, "Reviewer", Role.REVIEWER,
+                                           password="Temporary-Pass-123")
+            with self.assertRaisesRegex(ValueError, "Reviewer"):
+                self.repo.add_attributed_note(session_id, "demo12.admin", "Reviewer", "Unauthorized")
+            self.repo.add_attributed_note(session_id, reviewer.username, reviewer.role.value, "Follow-up")
+            reloaded, = self.repo.filter_records(text=session_id)
+            self.assertEqual(reloaded.attributed_notes[-1].author, reviewer.username)
+            self.assertEqual(reloaded.attributed_notes[-1].text, "Follow-up")
+            self.assertTrue(any(e.action == "review_note_added" for e in reloaded.audit_trail))
+            self.assertEqual(reloaded.assessment, record.assessment)
+            self.assertEqual(reloaded.review, record.review)
+            self.assertEqual(signed_payload(), original)
+
+    def test_dashboard_counts_current_slots_only(self) -> None:
+        summaries = {row.order.order_code: row for row in self.repo.sample_progress()}
+        self.assertEqual(summaries["DEMO-V12-01"].sample_size, 0)
+        squid = summaries["DEMO-V12-05"]
+        self.assertEqual((squid.sample_size, squid.passed, squid.failed, squid.reinspect), (2, 1, 1, 0))
+        self.assertEqual(squid.completion_rate, 100)
 
     def test_default_workstation_loads_the_new_schema(self) -> None:
         self.assertIsInstance(create_repository(AppSettings()), PostgresRepository)
