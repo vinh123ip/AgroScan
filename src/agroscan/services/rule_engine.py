@@ -55,6 +55,8 @@ def _ratio_reasons(
 
 def _exceeds_limit(criterion: DefectCriterion, ratio: float) -> bool:
     # Small epsilon so 10% of 20 objects (0.1) is not flagged by float noise.
+    if criterion.operator == "ge":
+        return ratio >= criterion.max_ratio - 1e-9
     return ratio > criterion.max_ratio + 1e-9
 
 

@@ -403,7 +403,10 @@ class BoxIntakePage(ScrollPage):
 
     def _render_loaded_box(self, box_code: BoxCode, order: Order) -> None:
         product = order.product
-        approx_per_box = max(1, round(order.expected_quantity / max(1, order.total_boxes)))
+        size = f"{order.total_boxes} boxes"
+        if order.expected_quantity is not None:
+            approx = max(1, round(order.expected_quantity / order.total_boxes))
+            size += f" · {order.expected_quantity} units (~{approx}/box)"
         healthy = product.detect_classes[0] if product.detect_classes else "—"
         defects = ", ".join(product.detect_classes[1:]) if len(product.detect_classes) > 1 else "none"
         progress_text = self._order_progress_text(order.order_code)
@@ -411,7 +414,7 @@ class BoxIntakePage(ScrollPage):
         self.info_grid.set_items([
             ("Order",             order.order_code),
             ("Box",               f"{box_code.box_number} of {order.total_boxes}  ({box_code.text})"),
-            ("Lot Size",          f"{order.total_boxes} boxes · {order.expected_quantity} units (~{approx_per_box}/box)"),
+            ("Lot Size",          size),
             ("Declared Category", product.category),
             ("Declared Product",  f"{product.name} ({product.code})"),
             ("Supplier",          order.supplier),

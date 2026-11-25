@@ -29,6 +29,7 @@ from agroscan.services.app_settings import AppSettings
 from agroscan.services.evidence_service import configure_evidence_storage
 from agroscan.services.mock_auth import MockAuthService
 from agroscan.services.mock_repository import MockRepository
+from agroscan.services.postgres_repository import PostgresRepository
 from agroscan.ui.components.loading_screen import LoadingScreen
 from agroscan.ui.navigation import (
     PAGE_SPECS,
@@ -344,7 +345,7 @@ class MainWindow(QMainWindow):
         if key == PageKey.CATALOG:
             return CatalogPage(self._repo)
         if key == PageKey.DATA_IMPORT:
-            return DataImportPage(self._repo)
+            return DataImportPage(self._repo, actor=self._user.username)
         if key == PageKey.USERS:
             return UsersPage(self._repo, self._auth, self._user)
         if key == PageKey.SETTINGS:
@@ -472,12 +473,15 @@ class MainWindow(QMainWindow):
                 "or discard that session before opening another box."
             )
             return False
-        self._submit_record(record)
-        return True
+        return self._submit_record(record, on_error)
 
     def _open_session(self, box_code: BoxCode, order: Order, notes: str) -> None:
         station = self._settings.load().station_name
-        session = self._repo.create_session(box_code, order, self._user.username, station)
+        try:
+            session = self._repo.create_session(box_code, order, self._user.username, station)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Inspection could not be opened", str(exc))
+            return
         session.notes = notes
         self._assessment_record = None
         self.live_inspection_page.start_session(session)
@@ -485,13 +489,36 @@ class MainWindow(QMainWindow):
         self.box_intake_page.set_active_session(session)
         self.navigate_to(PageKey.LIVE_INSPECTION)
 
-    def _submit_record(self, record: InspectionRecord) -> None:
+    def _submit_record(self, record: InspectionRecord, on_error: Optional[Callable[[str], None]] = None) -> bool:
         """Persist AI recommendation and transition the session to Pending Review (D-020)."""
-        self._repo.submit_for_review(record)
+        postgres = isinstance(self._repo, PostgresRepository)
+        if postgres:
+            answer = QMessageBox.question(
+                self, "Confirm whole-box coverage",
+                "The last captured image must show every distinct item in this box for counting. "
+                "Earlier images will be attached as supporting views of the same batch. "
+                "Does the last image cover the whole box?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return False
+        try:
+            if postgres:
+                self._repo.submit_for_review(record, coverage_confirmed=True)
+            else:
+                self._repo.submit_for_review(record)
+        except ValueError as exc:
+            if on_error:
+                on_error(str(exc))
+            else:
+                QMessageBox.warning(self, "Inspection could not be submitted", str(exc))
+            return False
         self._assessment_record = None
         self.live_inspection_page.clear_session()
         self.box_intake_page.set_active_session(None)
         self._show_notice(f"✔  Box {record.session.box_code} submitted for review")
+        return True
 
     def _on_inspection_finished(self, record: InspectionRecord) -> None:
         self._assessment_record = record
@@ -506,7 +533,8 @@ class MainWindow(QMainWindow):
         self.navigate_to(PageKey.LIVE_INSPECTION)
 
     def _on_submit_requested(self, record: InspectionRecord) -> None:
-        self._submit_record(record)
+        if not self._submit_record(record):
+            return
         self.box_intake_page.reset_form()
         self.navigate_to(PageKey.BOX_INTAKE)
 

@@ -12,6 +12,7 @@ class Role(Enum):
     ADMIN     = "Admin"
     INSPECTOR = "Inspector"
     REVIEWER  = "Reviewer"
+    MANAGER   = "Manager"
 
 
 @dataclass

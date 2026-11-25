@@ -11,7 +11,7 @@ python run.py
 
 Launcher tự chọn Python trong `.venv`. Với địa chỉ AI mặc định, launcher cũng mở dịch vụ VLM tại `127.0.0.1:8000` trong thời gian dùng ứng dụng. Nếu cổng đang có tiến trình sử dụng, desktop tiếp tục dùng địa chỉ đã cấu hình. Nếu có LM Studio chạy mô hình thị giác tại cổng `1234`, bridge có thể gửi ảnh đến mô hình. Khi chạy dự phòng, kết quả phân tích được tạo theo quy tắc. Các model ONNX baseline đi kèm bước thiết lập phục vụ kiểm tra luồng và dữ liệu mô phỏng.
 
-**PostgreSQL.** File `.vevn` là mẫu. Ứng dụng đọc `.env` trong thư mục gốc. Trên máy này cả hai đã được tạo. Điền mật khẩu của tài khoản `postgres` vào `AGROSCAN_DB_PASSWORD` trong `.env`, lưu rồi mở lại ứng dụng. Đích mặc định là `agroscan` trên `127.0.0.1:5432`. Nếu có hộp thoại **Database Offline — Demo Fallback**, bạn vẫn kiểm tra được giao diện bằng dữ liệu RAM. Muốn kiểm tra lưu dữ liệu qua lần mở sau, cần kết nối PostgreSQL.
+**PostgreSQL v1.2.** Ứng dụng đọc cấu hình kết nối từ `.env`, có thể sao chép mẫu `.env.example`. Môi trường dev hiện dùng database `agroscan_dev` và tài khoản kết nối `agro_user`. Dùng `python run.py --demo` để mở chế độ mô phỏng dùng RAM.
 
 **Máy mới của thành viên nhóm.** Từ thư mục repo trên Windows, chạy một lần:
 
@@ -19,21 +19,26 @@ Launcher tự chọn Python trong `.venv`. Với địa chỉ AI mặc định, 
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 .\.venv\Scripts\python.exe scripts/export_yolo_onnx.py
-if (!(Test-Path .env)) { Copy-Item .vevn .env }
+if (!(Test-Path .env)) { Copy-Item .env.example .env }
 ```
 
-**Khởi tạo database lần đầu.** Nếu đã có database chứa dữ liệu, giữ nguyên và kiểm tra các bảng trước. Script `scripts/init_db.sql` có lệnh `DROP TABLE`. Đoạn dưới chỉ nạp schema và dữ liệu mẫu sau khi PostgreSQL xác nhận vừa tạo thành công một database mới. Chỉnh đường dẫn nếu cài phiên bản PostgreSQL khác.
+**Khởi tạo database lần đầu.** Trong pgAdmin, mở Query Tool vào database đích bằng tài khoản quản trị PostgreSQL. Chạy lần lượt [01_schema.sql](../scripts/db_v1_2/01_schema.sql), [02_seed.sql](../scripts/db_v1_2/02_seed.sql) và [03_grant_app.sql](../scripts/db_v1_2/03_grant_app.sql). Nếu schema đã có, bắt đầu từ script seed. Script cấp quyền dùng vai trò `agro_user`. Nếu máy dùng tên khác, sửa tên vai trò trong script cho khớp cấu hình.
+
+Tạo tài khoản quản trị ứng dụng bằng PowerShell. Lệnh hỏi mật khẩu hai lần và lưu giá trị băm trong PostgreSQL.
 
 ```powershell
-$pgBin = 'C:\Program Files\PostgreSQL\18\bin'
-& "$pgBin\createdb.exe" -h 127.0.0.1 -p 5432 -U postgres agroscan
-if ($LASTEXITCODE -eq 0) {
-    $env:PGCLIENTENCODING = 'UTF8'
-    & "$pgBin\psql.exe" -X -v ON_ERROR_STOP=1 -1 -h 127.0.0.1 -p 5432 -U postgres -d agroscan -f scripts/init_db.sql
-}
+python run.py --create-admin TEN_DANG_NHAP
+python run.py
 ```
 
-## Chức năng và tài khoản thử
+## Kiểm thử PostgreSQL v1.2
+
+- Đăng nhập bằng tài khoản vừa tạo. Trong **Box Intake**, tra `AGS:DEMO-V12-02-04/04` và đối chiếu mã thùng bằng token `00000000-0000-4000-8000-000000120024`.
+- Trong **Data Import**, kiểm tra năm đơn `DEMO-V12-01` đến `DEMO-V12-05`. Trong **Inspection History**, kiểm tra phiên nháp của lô chuối, phiên chờ duyệt của lô tôm và lịch sử tái kiểm của lô mực. Lô mực có quyết định cấp lô `approve`.
+- Tạo tài khoản Inspector và Reviewer trong **Users**. Lô tôm có thùng `AGS:DEMO-V12-04-02/03` được chọn và chưa kiểm trong seed. Luồng desktop hiện hỗ trợ một batch. Ảnh cuối cùng là ảnh đếm, ảnh trước đó là ảnh bổ sung. Dùng một ảnh bao quát toàn bộ thùng, có vật thể được detector phát hiện, rồi xác nhận độ bao phủ khi nộp. Reviewer độc lập xử lý phiên và nhập lý do.
+- Tạo hoặc điều chỉnh kế hoạch lấy mẫu và ký quyết định cấp lô theo quy trình v1.2. Giao diện hiện đọc kế hoạch và quyết định đã lưu.
+
+## Chức năng và tài khoản thử trong chế độ demo
 
 | Vai trò | Tài khoản mẫu | Chức năng chính |
 | --- | --- | --- |
@@ -41,11 +46,11 @@ if ($LASTEXITCODE -eq 0) {
 | Reviewer | `reviewer` / `reviewer123` | Mở hàng đợi, xem ảnh và hash, ghi chú, xác nhận đạt, không đạt hoặc yêu cầu kiểm lại. |
 | Admin | `admin` / `admin123` | Quản lý danh mục và tiêu chí, người dùng, cấu hình trạm, nhập đơn, tra lịch sử và xuất báo cáo. |
 
-Ba tài khoản trên dùng để đăng nhập **ứng dụng**. Tài khoản `postgres` trong `.env` dùng cho kết nối cơ sở dữ liệu. Mã thùng mẫu `AGS:DH00123-07/10` là thùng 7 trong đơn 10 thùng chuối. Khi thử các ca khác nhau, dùng số thùng khác trong cùng đơn để dễ tìm kết quả.
+Ba tài khoản trên dành cho `python run.py --demo`. Dùng tài khoản ứng dụng đã tạo trên PostgreSQL khi chạy chế độ v1.2. Mã thùng mẫu `AGS:DH00123-07/10` là thùng 7 trong đơn 10 thùng chuối. Khi thử các ca khác nhau, dùng số thùng khác trong cùng đơn để dễ tìm kết quả.
 
 ## Các ca kiểm thử thủ công
 
-Chạy TC01–TC07 theo thứ tự cho một lượt kiểm định hoàn chỉnh. Ghi mã phiên hiển thị trên màn hình để tra lại đúng lượt. Khi báo lỗi, ghi mã ca, vai trò, mã thùng, chế độ PostgreSQL/RAM và kết quả thực tế.
+Mở `python run.py --demo` rồi chạy TC01–TC07 theo thứ tự cho một lượt kiểm định hoàn chỉnh. Ghi mã phiên hiển thị trên màn hình để tra lại đúng lượt. Khi báo lỗi, ghi mã ca, vai trò, mã thùng, chế độ PostgreSQL/RAM và kết quả thực tế.
 
 | Mã | Thao tác | Kết quả mong đợi |
 | --- | --- | --- |
@@ -54,7 +59,7 @@ Chạy TC01–TC07 theo thứ tự cho một lượt kiểm định hoàn chỉn
 | TC03 · Chụp bằng chứng | Chọn **Start Inspection → Simulation Feed → Fresh Bananas → Capture Evidence**. | Có ảnh xem trước, số lượng phát hiện và ảnh thu nhỏ trong danh sách bằng chứng. Có thể kết thúc sau khi chụp. |
 | TC04 · Đánh giá | Chọn **Finish Inspection**, xem lý do và chọn **Submit for Review**. Dùng thùng khác để thử lại với **Rotten Bananas** và bộ tiêu chí BANANA mặc định. | Ca tươi cho khuyến nghị đạt, ca có lỗi thối nghiêm trọng cho khuyến nghị không đạt. Phiên đã gửi xuất hiện ở **Review Queue**. |
 | TC05 · Kiểm duyệt | Đăng xuất, vào bằng Reviewer. Chọn phiên vừa gửi, mở ảnh, xem SHA-256, nhập ghi chú và chọn **Pass** hoặc **Fail**. | Ảnh mở được và hiển thị kết quả kiểm tra toàn vẹn. Phiên đã xử lý rời hàng đợi và tra được trong lịch sử. Thử **Re-inspect** trên phiên riêng để xem quyết định kiểm lại. |
-| TC06 · Lưu bền | Khi đang dùng PostgreSQL, đóng hẳn ứng dụng và chạy lại `python run.py`. Mở **Inspection History**, tìm theo đơn hoặc ngày. | Tìm lại được phiên và quyết định vừa ghi. Phân biệt khuyến nghị của máy với quyết định của Reviewer. |
+| TC06 · Lịch sử | Mở **Inspection History** trong cùng phiên chạy demo, tìm theo đơn hoặc ngày. | Tìm lại được phiên và quyết định vừa ghi. Phân biệt khuyến nghị của máy với quyết định của Reviewer. |
 | TC07 · Xuất báo cáo | Từ lịch sử xuất PDF cho một phiên. Vào **Reports**, lọc đúng ngày và sản phẩm, chọn **Apply Filter**, xuất PDF và Excel. | PDF mở được, đúng phiên hoặc kỳ đã chọn. Excel có các trang **Order Summary**, **Inspection Sessions**, **Evidence Integrity**. Đối chiếu mã phiên và hash với ứng dụng. |
 | TC08 · Nhập đơn | Admin mở **Data Import**, lưu mẫu CSV hoặc XLSX. Dùng mã đơn thử mới. Thêm một dòng có product code lạ và một dòng có `total_boxes=0`. Nạp tệp, xem preview, chọn **Import Valid Orders to DB**. | Preview chỉ đúng dòng lỗi và số dòng hợp lệ. Đơn hợp lệ xuất hiện trong danh sách. Các dòng lỗi được bỏ qua. Lặp lại với định dạng còn lại. |
 | TC09 · Tiêu chí và phân quyền | Đăng nhập Admin, mở **Catalog**, tạo sản phẩm thử, nhập trùng loại lỗi rồi sửa thành bộ tiêu chí hợp lệ và lưu. Đăng nhập Inspector để so sánh menu. | Editor báo lỗi trùng. Bộ tiêu chí hợp lệ lưu được. Các chức năng quản trị chỉ xuất hiện với vai trò phù hợp. |
@@ -64,4 +69,4 @@ Chạy TC01–TC07 theo thứ tự cho một lượt kiểm định hoàn chỉn
 
 ## Kiểm tra tự động
 
-`python tests/e2e_walkthrough.py` kiểm tra luồng giao diện với dữ liệu mock. `python run_tests.py` chạy bộ test đầy đủ, trong đó có ca tạo, cập nhật và xóa dữ liệu thử trong PostgreSQL. Khi chạy bộ đầy đủ, dùng database kiểm thử riêng đã nạp schema và seed, đồng thời trỏ cấu hình kết nối tới database đó. Kết quả cuối cần có `Failures: 0` và `Errors: 0`.
+`python tests/e2e_walkthrough.py` kiểm tra luồng giao diện với dữ liệu mock. `python run_tests.py` chạy bộ test đầy đủ, trong đó có ca đọc seed, nhập đơn, nộp và duyệt kiểm định trong giao dịch được rollback khi kết thúc. Khi chạy bộ đầy đủ, dùng database kiểm thử riêng đã nạp schema và seed, đồng thời trỏ cấu hình kết nối tới database đó. Kết quả cuối cần có `Failures: 0` và `Errors: 0`.

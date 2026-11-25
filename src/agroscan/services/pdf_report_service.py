@@ -220,7 +220,8 @@ def export_inspection_record_pdf(
         ["Product", f"{product.name} ({product.code})", "Supplier", order.supplier],
         [
             "Lot Size",
-            f"{order.total_boxes} boxes ({order.expected_quantity} units)",
+            f"{order.total_boxes} boxes"
+            + (f" ({order.expected_quantity} units)" if order.expected_quantity is not None else ""),
             "Station / Inspector",
             f"{session.station} / {session.inspector}",
         ],

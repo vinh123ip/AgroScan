@@ -44,7 +44,6 @@ from agroscan.services.evidence_service import (
 )
 from agroscan.services.mock_auth import MockAuthService
 from agroscan.services.mock_repository import MockRepository
-from agroscan.services.postgres_repository import PostgresRepository
 from agroscan.ui.components.evidence_strip import EvidenceStrip
 from agroscan.ui.components.evidence_viewer_dialog import EvidenceViewerDialog
 from agroscan.ui.main_window import MainWindow
@@ -255,25 +254,6 @@ class TestFlowWithMockRepository(_FlowMixin, unittest.TestCase):
     def setUp(self) -> None:
         self.repo = MockRepository(seed=42)
         self.created_session_ids = []
-
-    def test_intake_live_assessment_review_flow(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            self._run_flow(self.repo, tmp)
-
-
-class TestFlowWithPostgres(_FlowMixin, unittest.TestCase):
-    def setUp(self) -> None:
-        self.repo = PostgresRepository()
-        ok, msg = self.repo.ping()
-        if not ok:
-            self.fail(f"PostgreSQL must be reachable for live flow tests: {msg}")
-        self.created_session_ids = []
-
-    def tearDown(self) -> None:
-        with self.repo._connection() as conn:
-            with conn.cursor() as cur:
-                for sid in self.created_session_ids:
-                    cur.execute("DELETE FROM inspection_sessions WHERE session_id = %s", (sid,))
 
     def test_intake_live_assessment_review_flow(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

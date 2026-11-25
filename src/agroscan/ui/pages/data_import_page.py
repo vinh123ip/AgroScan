@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
 )
 
 from agroscan.services.mock_repository import MockRepository
+from agroscan.services.postgres_repository import PostgresRepository
 from agroscan.ui.components.data_table import DataTable
 from agroscan.ui.components.page_layout import PageHeader, ScrollPage, SectionCard, make_hint
 from agroscan.ui.formatting import fmt_datetime
@@ -101,9 +102,12 @@ class DataImportPage(ScrollPage):
 
     orders_imported = Signal(int)  # number of imported orders
 
-    def __init__(self, repo: MockRepository, parent: Optional[QWidget] = None) -> None:
+    def __init__(self, repo: MockRepository | PostgresRepository,
+                 parent: Optional[QWidget] = None, *, actor: str = "") -> None:
         super().__init__("DataImportPage", parent)
         self._repo = repo
+        self._actor = actor
+        self._source_file = ""
         self._staged_rows: list[dict[str, str]] = []
         self._init_ui()
         self.refresh()
@@ -179,7 +183,8 @@ class DataImportPage(ScrollPage):
         # Current Orders in DB
         orders_card = SectionCard("3. Existing Orders in Database")
         self.orders_table = DataTable(
-            ["Order Code", "Product", "Supplier", "Total Boxes", "Expected Qty", "Created At"]
+            ["Order Code", "Lot", "Product", "Supplier", "Total Boxes",
+             "Expected Qty", "Lot Decision", "Created At"]
         )
         self.orders_table.setMinimumHeight(240)
         orders_card.body.addWidget(self.orders_table)
@@ -206,13 +211,17 @@ class DataImportPage(ScrollPage):
                 return False, "✖ Boxes & Qty must be >= 1"
         except ValueError:
             return False, "✖ Invalid integer in Boxes/Qty"
-        action = "Update existing" if order_code in self._repo.orders else "New order"
+        exists = order_code in self._repo.orders
+        if exists and isinstance(self._repo, PostgresRepository):
+            return False, "Order already exists"
+        action = "Update existing" if exists else "New order"
         return True, f"✔ Ready ({action})"
 
     def load_file(self, file_path: Union[Path, str]) -> int:
         """Load and validate rows from ``file_path`` into the preview table."""
         rows = parse_import_file(file_path)
         self._staged_rows = rows
+        self._source_file = Path(file_path).name
         preview_rows: list[list[str]] = []
         valid_count = 0
         for idx, row in enumerate(rows, start=1):
@@ -242,14 +251,19 @@ class DataImportPage(ScrollPage):
         """Commit valid staged rows into the repository."""
         if not self._staged_rows:
             return 0, ["No rows staged."]
-        imported, errors = self._repo.import_orders(self._staged_rows)
+        if isinstance(self._repo, PostgresRepository):
+            imported, errors = self._repo.import_orders(
+                self._staged_rows, actor=self._actor, source_file=self._source_file,
+            )
+        else:
+            imported, errors = self._repo.import_orders(self._staged_rows)
         self._staged_rows = []
         self.preview_table.set_rows([])
         self.btn_commit.setEnabled(False)
         self.refresh()
         if errors:
             self.status_label.setText(
-                f"✔  Imported {imported} order(s) with {len(errors)} skipped row(s)."
+                f"Imported {imported} order(s), skipped {len(errors)}. {errors[0]}"
             )
         else:
             self.status_label.setText(f"✔  Successfully imported {imported} order(s) into database.")
@@ -263,10 +277,12 @@ class DataImportPage(ScrollPage):
             [
                 [
                     o.order_code,
+                    o.lot_code or "—",
                     f"{o.product.name} ({o.product.code})",
                     o.supplier,
                     str(o.total_boxes),
-                    str(o.expected_quantity),
+                    str(o.expected_quantity) if o.expected_quantity is not None else "—",
+                    o.lot_outcome or "—",
                     fmt_datetime(o.created_at),
                 ]
                 for o in orders

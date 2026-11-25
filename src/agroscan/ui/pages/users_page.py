@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
 from agroscan.models.user_models import Role, User
 from agroscan.services.mock_auth import MockAuthService
 from agroscan.services.mock_repository import MockRepository
+from agroscan.services.postgres_repository import PostgresRepository
 from agroscan.ui.components.data_table import DataTable
 from agroscan.ui.components.page_layout import PageHeader, ScrollPage, SectionCard, make_hint
 
@@ -187,7 +188,7 @@ class UsersPage(ScrollPage):
             is_active=is_active,
             password=password,
         )
-        if self._auth is not None:
+        if self._auth is not None and not isinstance(self._repo, PostgresRepository):
             self._auth.upsert_user(
                 username=name,
                 display_name=display_name,

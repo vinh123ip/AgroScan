@@ -40,6 +40,7 @@ from PySide6.QtWidgets import (
 )
 
 from agroscan.models.inspection_models import (
+    DetectedUnit,
     DetectionResult,
     EvidenceImage,
     InspectionRecord,
@@ -637,9 +638,17 @@ class LiveInspectionPage(QWidget):
         except Exception:
             item = EvidenceImage(captured_at=datetime.now(), is_auto_capture=False)
 
+        item.width_px, item.height_px = image.width(), image.height()
+        item.source_kind = "imported_image" if self._is_sim_mode else "camera"
+        item.demo_image = self._is_sim_mode and self.sim_sample_combo.currentData() != "custom"
         display_image = image
         if self._yolo_engine.is_loaded:
             yolo_out = self._yolo_engine.infer(image, track=True)
+            item.model_file = self._yolo_engine.model_path.name
+            item.units = [
+                DetectedUnit(box.x1, box.y1, box.width, box.height, box.label, box.confidence)
+                for box in yolo_out.boxes if box.width > 0 and box.height > 0
+            ]
             if yolo_out.detection.total_objects > 0:
                 self._detection = yolo_out.detection
                 display_image = draw_detections_on_qimage(

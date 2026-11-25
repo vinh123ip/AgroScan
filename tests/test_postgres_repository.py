@@ -1,11 +1,14 @@
-"""Integration & unit tests for PostgreSQL database configuration and PostgresRepository (T1.2)."""
+"""Configuration and workstation integration tests for PostgreSQL v1.2."""
 
-from datetime import date, datetime
+from contextlib import contextmanager
+from datetime import datetime
 import os
 from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
+from uuid import uuid4
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -14,15 +17,15 @@ SRC_DIR = ROOT_DIR / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from PySide6.QtCore import QSettings
+from PySide6.QtGui import QImage
 from PySide6.QtWidgets import QApplication
 
 from agroscan.models.inspection_models import (
     AiRecommendation,
     BoxCode,
+    DetectedUnit,
     DefectCriterion,
     DetectionResult,
-    EvidenceImage,
     InspectionRecord,
     Product,
     QualityAssessmentResult,
@@ -31,11 +34,13 @@ from agroscan.models.inspection_models import (
     SessionStatus,
 )
 from agroscan.models.user_models import Role
-from agroscan.services import mock_ai
-from agroscan.services.app_settings import AppSettings, ConnectionSettings
-from agroscan.services.database import parse_env_file, resolve_db_config
-from agroscan.services.mock_auth import MockAuthService
+from agroscan.services.app_settings import ConnectionSettings
+from agroscan.services.database import get_connection, parse_env_file, resolve_db_config
+from agroscan.services.evidence_service import capture_and_save_evidence
+from agroscan.services.postgres_auth import PostgresAuthService
 from agroscan.services.postgres_repository import PostgresRepository
+from agroscan.main import create_repository
+from agroscan.services.app_settings import AppSettings
 from agroscan.ui.main_window import MainWindow
 from agroscan.ui.navigation import PageKey
 from agroscan.ui.theme import apply_theme
@@ -85,148 +90,124 @@ class TestDatabaseConfigResolution(unittest.TestCase):
 
 
 class TestPostgresRepositoryLive(unittest.TestCase):
-    """Live integration tests against local PostgreSQL 'agroscan' database."""
+    """Exercise the seeded schema, including writes that roll back after each test."""
 
     def setUp(self) -> None:
         self.repo = PostgresRepository()
-        ok, msg = self.repo.ping()
-        if not ok:
-            self.fail(f"PostgreSQL must be reachable for live repository tests: {msg}")
-        self._created_session_ids: list[str] = []
-        self._created_product_codes: list[str] = []
+        ok, message = self.repo.ping()
+        self.assertTrue(ok, message)
 
-    def tearDown(self) -> None:
-        with self.repo._connection() as conn:
-            with conn.cursor() as cur:
-                for sid in self._created_session_ids:
-                    cur.execute("DELETE FROM inspection_sessions WHERE session_id = %s", (sid,))
-                for code in self._created_product_codes:
-                    cur.execute("DELETE FROM products WHERE code = %s", (code,))
+    @contextmanager
+    def isolated_writes(self):
+        connection = get_connection(self.repo.db_config)
+        try:
+            @contextmanager
+            def use_transaction():
+                with connection.cursor() as cur:
+                    cur.execute("SAVEPOINT repository_call")
+                    cur.execute("SET CONSTRAINTS ALL DEFERRED")
+                try:
+                    yield connection
+                    with connection.cursor() as cur:
+                        cur.execute("SET CONSTRAINTS ALL IMMEDIATE")
+                        cur.execute("RELEASE SAVEPOINT repository_call")
+                except Exception:
+                    with connection.cursor() as cur:
+                        cur.execute("ROLLBACK TO SAVEPOINT repository_call")
+                        cur.execute("RELEASE SAVEPOINT repository_call")
+                    raise
 
-    def test_seeded_catalog_orders_and_users(self) -> None:
-        products = self.repo.products
-        codes = {p.code for p in products}
-        self.assertTrue({"BANANA", "APPLE", "MANGO"}.issubset(codes))
+            with patch.object(self.repo, "_connection", use_transaction):
+                yield
+        finally:
+            connection.rollback()
+            connection.close()
 
-        banana = self.repo.find_product("BANANA")
-        assert banana is not None
-        self.assertEqual(banana.model_file, "banana_defect.onnx")
-        self.assertGreaterEqual(len(banana.criteria), 2)
-
-        box_code, order = self.repo.resolve_box("AGS:DH00123-01/10")
-        self.assertEqual(box_code, BoxCode("DH00123", 1, 10))
-        self.assertEqual(order.product.code, "BANANA")
-
+    def test_seeded_lots_and_scan_tokens(self) -> None:
+        orders = self.repo.orders
+        seeded = [orders[f"DEMO-V12-{index:02d}"] for index in range(1, 6)]
+        self.assertEqual([o.product.code for o in seeded], ["APPLE", "ORANGE", "BANANA", "SHRIMP", "SQUID"])
+        self.assertEqual([o.total_boxes for o in seeded], [3, 4, 3, 3, 3])
+        self.assertEqual(seeded[-1].lot_outcome, "approve")
+        box, order = self.repo.resolve_box("00000000-0000-4000-8000-000000120024")
+        self.assertEqual(box, BoxCode("DEMO-V12-02", 4, 4))
+        self.assertEqual(self.repo.resolve_box(box.text), (box, order))
         with self.assertRaises(ValueError):
-            self.repo.resolve_box("AGS:NOPE999-01/10")
+            self.repo.resolve_box("AGS:DEMO-V12-02-01/3")
 
-        users = {u.username: u for u in self.repo.users}
-        self.assertIn("admin", users)
-        self.assertEqual(users["admin"].role, Role.ADMIN)
-        self.assertEqual(users["inspector"].role, Role.INSPECTOR)
-        self.assertEqual(users["reviewer"].role, Role.REVIEWER)
+    def test_seeded_history_and_historical_accounts(self) -> None:
+        entries = {r.session_id: r for r in self.repo.records}
+        self.assertEqual(entries["INS--120311"].status, SessionStatus.IN_PROGRESS)
+        self.assertEqual(len(entries["INS--120411"].evidence), 3)
+        self.assertEqual(entries["INS--120511"].review.decision, ReviewerDecision.RE_INSPECT)
+        auth = PostgresAuthService(self.repo)
+        self.assertIsNone(auth.authenticate("demo12.admin", "!"))
 
-    def test_product_crud_persists_across_instances(self) -> None:
-        code = "TSTKIWI"
-        self._created_product_codes.append(code)
-        kiwi = Product(
-            code=code,
-            name="Test Kiwi",
-            category="Fruit",
-            model_file="kiwi_defect.onnx",
-            detect_classes=["fresh", "bruised", "rotten"],
-            criteria=[
-                DefectCriterion("bruised", 0.15, False),
-                DefectCriterion("rotten", 0.0, True),
-            ],
-            min_objects=4,
-            min_confidence=0.65,
-        )
-        saved = self.repo.save_product(kiwi)
-        self.assertEqual(saved.code, code)
+    def test_account_catalog_and_order_import(self) -> None:
+        with self.isolated_writes():
+            admin = self.repo.save_user(
+                f"test-{uuid4().hex}", "Test Admin", Role.ADMIN, password="Temporary-Pass-123",
+            )
+            self.assertEqual(PostgresAuthService(self.repo).authenticate(admin.username, "Temporary-Pass-123"), admin)
+            code = f"TST{uuid4().hex[:10].upper()}"
+            product = Product(code, "Test Kiwi", "Fruit", "fruit_defect.onnx",
+                              ["fresh", "bruised"], [DefectCriterion("bruised", 0.15)])
+            self.repo.save_product(product)
+            self.assertEqual(self.repo.find_product(code), product)
+            self.repo.delete_product(code)
+            self.assertIsNone(self.repo.find_product(code))
 
-        # Update existing
-        kiwi.name = "Test Green Kiwi"
-        kiwi.criteria[0].max_ratio = 0.08
-        self.repo.save_product(kiwi, original_code=code)
+            order_code = f"TEST-{uuid4().hex.upper()}"
+            data = [{"order_code": order_code, "product_code": "APPLE", "supplier": "Test",
+                     "total_boxes": 3, "expected_quantity": 15}]
+            result = self.repo.import_orders(data, actor=admin.username, source_file="test.csv")
+            self.assertEqual(result, (1, []))
+            order = self.repo.orders[order_code]
+            self.assertEqual(order.expected_quantity, 15)
+            self.assertEqual(self.repo.resolve_box(f"AGS:{order_code}-01/03")[1], order)
 
-        fresh_repo = PostgresRepository()
-        reloaded = fresh_repo.find_product(code)
-        assert reloaded is not None
-        self.assertEqual(reloaded.name, "Test Green Kiwi")
-        self.assertAlmostEqual(reloaded.criteria[0].max_ratio, 0.08)
+    def test_inspection_submission_and_independent_review(self) -> None:
+        with self.isolated_writes(), tempfile.TemporaryDirectory() as tmp:
+            maker = self.repo.save_user(f"test-{uuid4().hex}", "Maker", Role.INSPECTOR, password="Temporary-Pass-123")
+            reviewer = self.repo.save_user(f"test-{uuid4().hex}", "Reviewer", Role.REVIEWER, password="Temporary-Pass-123")
+            box, order = self.repo.resolve_box("AGS:DEMO-V12-04-02/03")
+            session = self.repo.create_session(box, order, maker.username, "STATION-TEST")
+            original = QImage(12, 12, QImage.Format.Format_RGB32)
+            original.fill(0xFFFFFFFF)
+            image = capture_and_save_evidence(original, session.session_id, storage_root=tmp)
+            image.width_px = image.height_px = 12
+            image.model_file = "fruit_defect.onnx"
+            image.units = [DetectedUnit(1, 1, 5, 5, "fresh", 0.9)]
+            record = InspectionRecord(
+                session, [image], DetectionResult(1, {"fresh": 1}, 0.9, False),
+                QualityAssessmentResult(AiRecommendation.NEEDS_REVIEW, [], {}),
+            )
+            with patch("agroscan.services.postgres_repository.verify_evidence_integrity", return_value=True):
+                self.repo.submit_for_review(record, coverage_confirmed=True)
+                self.repo.submit_for_review(record, coverage_confirmed=True)
+            self.assertEqual(record.status, SessionStatus.PENDING_REVIEW)
+            reloaded = next(r for r in self.repo.pending_records() if r.session_id == record.session_id)
+            self.assertEqual(reloaded.evidence[0].sha256, image.sha256)
+            self.assertEqual(reloaded.detection.total_objects, 1)
+            with self.assertRaises(ValueError):
+                self.repo.apply_review(reloaded, ReviewRecord(ReviewerDecision.PASS, maker.username, "Test"))
+            self.repo.apply_review(reloaded, ReviewRecord(ReviewerDecision.PASS, reviewer.username, "Verified"))
+            reread = next(r for r in self.repo.records if r.session_id == record.session_id)
+            self.assertEqual(reread.status, SessionStatus.COMPLETED)
+            self.assertEqual(reread.review.reviewer, reviewer.username)
 
-        fresh_repo.delete_product(code)
-        self.assertIsNone(fresh_repo.find_product(code))
-        self._created_product_codes.remove(code)
-
-    def test_inspection_lifecycle_persists_and_aggregates(self) -> None:
-        box_code, order = self.repo.resolve_box("AGS:DH00123-02/10")
-        session = self.repo.create_session(box_code, order, "inspector", "STATION-01")
-        self._created_session_ids.append(session.session_id)
-
-        detection = DetectionResult(
-            total_objects=20,
-            class_counts={"fresh": 17, "bruised": 3, "rotten": 0},
-            mean_confidence=0.89,
-            is_simulated=False,
-        )
-        assessment = QualityAssessmentResult(
-            recommendation=AiRecommendation.FAIL,
-            reasons=["Bruised ratio 15% exceeds limit 10%."],
-            defect_ratios={"bruised": 0.15, "rotten": 0.0},
-            is_simulated=False,
-        )
-        vlm = mock_ai.simulate_deep_analysis(session, detection, mock_ai.VlmScenario.NORMAL)
-        evidence = [EvidenceImage(datetime.now(), False, "DH00123/box_02.jpg", "a" * 64)]
-
-        record = InspectionRecord(session, evidence, detection, assessment, deep_analysis=vlm)
-        self.repo.submit_for_review(record)
-        self.assertEqual(record.status, SessionStatus.PENDING_REVIEW)
-
-        # Reload from a brand new PostgresRepository instance (simulating app restart)
-        repo2 = PostgresRepository()
-        pending = [r for r in repo2.pending_records() if r.session_id == session.session_id]
-        self.assertEqual(len(pending), 1)
-        loaded = pending[0]
-        self.assertEqual(loaded.detection.total_objects, 20)
-        self.assertEqual(loaded.evidence[0].sha256, "a" * 64)
-        self.assertIsNotNone(loaded.deep_analysis)
-
-        # Reviewer applies decision
-        review = ReviewRecord(ReviewerDecision.FAIL, "reviewer", "Confirmed bruised > 10%")
-        repo2.apply_review(loaded, review)
-
-        repo3 = PostgresRepository()
-        completed = [r for r in repo3.records_for_box(box_code) if r.session_id == session.session_id]
-        self.assertEqual(len(completed), 1)
-        self.assertEqual(completed[0].status, SessionStatus.COMPLETED)
-        assert completed[0].review is not None
-        self.assertEqual(completed[0].review.decision, ReviewerDecision.FAIL)
-
-        summaries = {s.order.order_code: s for s in repo3.order_summaries()}
-        self.assertGreaterEqual(summaries["DH00123"].failed, 1)
-
-        today = date.today()
-        outcomes = repo3.daily_outcomes(today, today, product_code="BANANA")
-        self.assertEqual(len(outcomes), 1)
-        self.assertGreaterEqual(outcomes[0][2], 1)  # failed count >= 1
-
-    def test_main_window_boots_with_postgres_repository(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            settings = AppSettings(QSettings(str(Path(tmp) / "s.ini"), QSettings.Format.IniFormat))
-            auth = MockAuthService()
-            admin = auth.authenticate("admin", "admin123")
-            assert admin is not None
-            win = MainWindow(admin, auth, self.repo, settings)
-            self.assertIsNotNone(win.page(PageKey.DASHBOARD))
-            self.assertIsNotNone(win.page(PageKey.BOX_INTAKE))
-            self.assertIsNotNone(win.page(PageKey.REVIEW_QUEUE))
-            self.assertIsNotNone(win.page(PageKey.CATALOG))
-            win.shutdown()
-            win.deleteLater()
+    def test_default_workstation_loads_the_new_schema(self) -> None:
+        self.assertIsInstance(create_repository(AppSettings()), PostgresRepository)
+        with self.isolated_writes():
+            admin = self.repo.save_user(f"test-{uuid4().hex}", "Admin", Role.ADMIN, password="Temporary-Pass-123")
+            auth = PostgresAuthService(self.repo)
+            window = MainWindow(admin, auth_service=auth, repo=self.repo)
+            try:
+                window.navigate_to(PageKey.BOX_INTAKE)
+                self.assertTrue(window.box_intake_page.load_code("AGS:DEMO-V12-02-04/04"))
+            finally:
+                window.close()
 
 
 if __name__ == "__main__":
     unittest.main()
-

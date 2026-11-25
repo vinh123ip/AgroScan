@@ -298,7 +298,8 @@ class QrLabelDialog(QDialog):
             self.meta_label.setText(
                 f"{order.product.name} ({order.product.category})  ·  {order.supplier}\n"
                 f"Box {box_code.box_number} of {order.total_boxes}  ·  "
-                f"Lot: {order.total_boxes} boxes ({order.expected_quantity} units)"
+                f"Lot: {order.total_boxes} boxes"
+                + (f" ({order.expected_quantity} units)" if order.expected_quantity is not None else "")
             )
         except ValueError as exc:
             self.meta_label.setText(f"Test negative case: {exc}")

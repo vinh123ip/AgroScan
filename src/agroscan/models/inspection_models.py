@@ -58,6 +58,7 @@ class DefectCriterion:
     defect_class: str          # Ví dụ: "bruised", "rotten"
     max_ratio:    float        # 0.0 – 1.0; vượt ngưỡng → đề xuất Fail
     is_critical:  bool = False # Có là đề xuất Fail ngay
+    operator: str = "gt"
 
 
 @dataclass
@@ -82,8 +83,11 @@ class Order:
     product:           Product
     supplier:          str
     total_boxes:       int
-    expected_quantity: int
+    expected_quantity: Optional[int]
     created_at:        datetime = field(default_factory=datetime.now)
+    lot_id: Optional[int] = None
+    lot_code: Optional[str] = None
+    lot_outcome: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -92,7 +96,7 @@ class Order:
 
 
 _BOX_CODE_PATTERN = re.compile(
-    r"^AGS:(?P<order>[A-Z0-9]+)-(?P<box>\d{1,4})/(?P<total>\d{1,4})$"
+    r"^AGS:(?P<order>[A-Z0-9][A-Z0-9_:-]*)-(?P<box>\d{1,4})/(?P<total>\d{1,4})$"
 )
 
 
@@ -159,6 +163,16 @@ class InspectionSession:
         return self.order.product
 
 
+@dataclass(frozen=True)
+class DetectedUnit:
+    x: int
+    y: int
+    width: int
+    height: int
+    label: str
+    confidence: float
+
+
 @dataclass
 class EvidenceImage:
     """Ảnh tĩnh làm bằng chứng gốc (D-026).
@@ -170,6 +184,12 @@ class EvidenceImage:
     is_auto_capture: bool = False
     relative_path:   str = ""
     sha256:          str = ""
+    width_px: int = 0
+    height_px: int = 0
+    source_kind: str = "camera"
+    demo_image: bool = False
+    model_file: str = ""
+    units: list[DetectedUnit] = field(default_factory=list)
 
 
 @dataclass

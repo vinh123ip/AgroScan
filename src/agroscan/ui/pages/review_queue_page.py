@@ -6,6 +6,7 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
+    QMessageBox,
     QPlainTextEdit,
     QPushButton,
     QScrollArea,
@@ -146,7 +147,11 @@ class ReviewQueuePage(QWidget):
         if record is None:
             return
         notes = self.notes_field.toPlainText().strip()
-        self._repo.apply_review(record, ReviewRecord(decision, self._user.username, notes))
+        try:
+            self._repo.apply_review(record, ReviewRecord(decision, self._user.username, notes))
+        except ValueError as exc:
+            QMessageBox.warning(self, "Review could not be saved", str(exc))
+            return
         self.review_submitted.emit(record)
         self.refresh()
 

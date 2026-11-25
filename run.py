@@ -35,6 +35,9 @@ from agroscan.services.app_settings import AppSettings
 
 def launch() -> None:
     """Serve the default local VLM endpoint for the lifetime of the desktop app."""
+    if "--create-admin" in sys.argv or "--help" in sys.argv or "-h" in sys.argv:
+        main()
+        return
     if AppSettings().load().ai_url.rstrip("/") != "http://127.0.0.1:8000":
         main()
         return

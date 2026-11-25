@@ -1,14 +1,18 @@
 """Application entry point: LoginDialog <-> MainWindow lifecycle (D-027, D-032)."""
 
+import argparse
+from getpass import getpass
 import sys
 from typing import Optional
 
 from PySide6.QtCore import QObject, QTimer
 from PySide6.QtWidgets import QApplication, QDialog, QMessageBox
 
+from agroscan.models.user_models import Role
 from agroscan.services.app_settings import AppSettings
 from agroscan.services.mock_auth import MockAuthService
 from agroscan.services.mock_repository import MockRepository
+from agroscan.services.postgres_auth import PostgresAuthService
 from agroscan.services.postgres_repository import PostgresRepository
 from agroscan.ui.main_window import MainWindow
 from agroscan.ui.pages.login_dialog import LoginDialog
@@ -27,7 +31,7 @@ class AppController(QObject):
         self,
         settings: AppSettings,
         auth_service: MockAuthService,
-        repo: MockRepository,
+        repo: MockRepository | PostgresRepository,
         parent: Optional[QObject] = None,
     ) -> None:
         super().__init__(parent)
@@ -91,33 +95,48 @@ class AppController(QObject):
             QApplication.quit()
 
 
-def create_repository(settings: AppSettings, warn_on_fallback: bool = True) -> PostgresRepository | MockRepository:
-    """Connect to PostgreSQL if reachable, otherwise fall back to ``MockRepository``."""
-    pg_repo = PostgresRepository(settings)
-    ok, message = pg_repo.ping()
-    if ok:
-        return pg_repo
-    if warn_on_fallback:
-        QMessageBox.warning(
-            None,
-            "Database Offline — Demo Fallback",
-            f"Could not connect to PostgreSQL ({message}).\n\n"
-            "AgroScan will run in temporary RAM mode (MockRepository) so data will not "
-            "be saved after closing. Verify PostgreSQL service and .env credentials.",
-        )
-    return MockRepository()
+def create_repository(settings: AppSettings, *, demo: bool = False) -> PostgresRepository | MockRepository:
+    if demo:
+        return MockRepository()
+    repository = PostgresRepository(settings)
+    ok, message = repository.ping()
+    if not ok:
+        raise ValueError(message)
+    return repository
 
 
 def main() -> None:
-    app = QApplication(sys.argv)
+    parser = argparse.ArgumentParser(description="AgroScan workstation")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--demo", action="store_true", help="Use the in-memory demo database.")
+    mode.add_argument("--create-admin", metavar="LOGIN", help="Create a PostgreSQL workstation administrator.")
+    args = parser.parse_args()
+    settings = AppSettings()
+    if args.create_admin:
+        try:
+            repo = PostgresRepository(settings)
+            password = getpass("New workstation password: ")
+            if password != getpass("Confirm password: "):
+                raise ValueError("Passwords differ.")
+            repo.save_user(args.create_admin, args.create_admin, Role.ADMIN,
+                           password=password, create_only=True)
+        except ValueError as exc:
+            parser.exit(1, f"{exc}\n")
+        print(f"Created workstation administrator {args.create_admin.strip().lower()}.")
+        return
+
+    app = QApplication([sys.argv[0]])
     app.setApplicationName("AgroScan")
     apply_theme(app)
-
-    settings = AppSettings()
-    repo = create_repository(settings)
-    controller = AppController(settings, MockAuthService(), repo)
+    try:
+        repo = create_repository(settings, demo=args.demo)
+    except ValueError as exc:
+        QMessageBox.critical(None, "AgroScan v1.2 database unavailable", str(exc))
+        sys.exit(1)
+    auth = PostgresAuthService(repo) if isinstance(repo, PostgresRepository) else MockAuthService()
+    controller = AppController(settings, auth, repo)
     if not controller.show_login():
-        sys.exit(0)
+        return
     sys.exit(app.exec())
 
 

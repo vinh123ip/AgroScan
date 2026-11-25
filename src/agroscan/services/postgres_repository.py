@@ -1,781 +1,729 @@
-"""PostgreSQL-backed repository replacing ``MockRepository`` (T1.2).
+"""Data access for AgroScan Database Design v1.2."""
 
-Implements the exact public interface and semantics of ``MockRepository`` so
-all UI pages and workflows operate seamlessly against PostgreSQL without UI changes.
-"""
-
-from collections import defaultdict
+from collections import Counter, defaultdict
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
-import json
-from typing import Iterator, Optional
+from typing import Optional
+from uuid import UUID, uuid4
 
-from psycopg2.extensions import connection as PgConnection
+import psycopg2
+from psycopg2.extras import Json
 
 from agroscan.models.inspection_models import (
-    AiRecommendation,
-    BoxCode,
-    DefectCriterion,
-    DetectionResult,
-    EvidenceImage,
-    InspectionRecord,
-    InspectionSession,
-    Order,
-    OrderSummary,
-    Product,
-    QualityAssessmentResult,
-    ReviewerDecision,
-    ReviewRecord,
-    SessionStatus,
+    AiRecommendation, BoxCode, DefectCriterion, DetectionResult, EvidenceImage,
+    InspectionRecord, InspectionSession, Order, OrderSummary, Product,
+    QualityAssessmentResult, ReviewerDecision, ReviewRecord, SessionStatus,
 )
 from agroscan.models.user_models import Role, User
-from agroscan.models.vlm_models import VlmAnalysis, VlmSchemaError, parse_vlm_response
-from agroscan.services.app_settings import AppSettings, ConnectionSettings
+from agroscan.models.vlm_models import VlmSchemaError, parse_vlm_response
 from agroscan.services.catalog_validation import validate_product
-from agroscan.services.database import (
-    DbConfig,
-    get_connection,
-    resolve_db_config,
-    test_connection,
-)
+from agroscan.services.database import DbConfig, get_connection, resolve_db_config
+from agroscan.services.evidence_service import verify_evidence_integrity
+from agroscan.services.passwords import hash_password
 
 
-def _to_local_naive(dt: Optional[datetime]) -> Optional[datetime]:
-    """Convert timezone-aware timestamps from PostgreSQL into local naive datetimes."""
-    if dt is None:
-        return None
-    if dt.tzinfo is not None:
-        return dt.astimezone().replace(tzinfo=None)
-    return dt
+_STATUS = {
+    "draft": SessionStatus.IN_PROGRESS,
+    "submitted": SessionStatus.PENDING_REVIEW,
+    "reviewed": SessionStatus.COMPLETED,
+    "reinspect": SessionStatus.COMPLETED,
+}
+_RECOMMENDATION = {
+    "conforming": AiRecommendation.PASS,
+    "nonconforming": AiRecommendation.FAIL,
+}
+_ROLE = {"admin": Role.ADMIN, "inspector": Role.INSPECTOR, "manager": Role.MANAGER}
+_TABLES = """
+    'users', 'products', 'inspection_profiles', 'quality_rules', 'sampling_rules',
+    'orders', 'lots', 'boxes', 'sample_selections', 'inspections', 'inspection_batches',
+    'inspection_images', 'observed_products', 'lot_decisions', 'audit_logs'
+"""
+_BOXES = """
+    SELECT b.*, row_number() OVER (PARTITION BY lot_id ORDER BY box_code, id) AS box_number
+    FROM agroscan.boxes b
+"""
 
 
-def _parse_role(raw: str) -> Role:
-    cleaned = raw.strip().upper()
-    for role in Role:
-        if role.name == cleaned or role.value.upper() == cleaned:
-            return role
-    raise ValueError(f"Unknown user role in database: {raw!r}")
+def _local(value: datetime) -> datetime:
+    return value.astimezone().replace(tzinfo=None)
 
 
-def _parse_json_field(raw: object, default: object) -> object:
-    if raw is None:
-        return default
-    if isinstance(raw, str):
-        return json.loads(raw)
-    return raw
+def _user(login: str, role: str, can_review: bool, active: bool,
+          display_name: Optional[str] = None) -> User:
+    return User(login, display_name or login, Role.REVIEWER if can_review else _ROLE[role], active)
 
 
 class PostgresRepository:
-    """PostgreSQL data-access layer matching ``MockRepository``'s interface."""
+    """Read and update the agroscan namespace from the workstation."""
 
-    def __init__(
-        self,
-        settings: Optional[AppSettings | ConnectionSettings | DbConfig] = None,
-        db_config: Optional[DbConfig] = None,
-    ) -> None:
-        if db_config is not None:
-            self._config = db_config
-        elif isinstance(settings, DbConfig):
-            self._config = settings
-        else:
-            self._config = resolve_db_config(settings)
-        self._session_counter = 0
-        self._export_history: list[tuple[datetime, str, str, str]] = []
+    def __init__(self, settings=None, db_config: Optional[DbConfig] = None) -> None:
+        self._config = db_config or (
+            settings if isinstance(settings, DbConfig) else resolve_db_config(settings)
+        )
 
     @property
     def db_config(self) -> DbConfig:
         return self._config
 
     @contextmanager
-    def _connection(self) -> Iterator[PgConnection]:
-        conn = get_connection(self._config)
+    def _connection(self):
         try:
-            yield conn
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
+            conn = get_connection(self._config)
+            try:
+                with conn:
+                    yield conn
+            finally:
+                conn.close()
+        except psycopg2.Error as exc:
+            raise ValueError(exc.diag.message_primary or str(exc)) from exc
 
     def ping(self) -> tuple[bool, str]:
-        """Check whether the PostgreSQL server and schema are reachable."""
-        return test_connection(self._config)
+        try:
+            with self._connection() as conn, conn.cursor() as cur:
+                cur.execute("SELECT has_schema_privilege(to_regnamespace('agroscan'), 'USAGE')")
+                if not cur.fetchone()[0]:
+                    return False, (
+                        f"Schema agroscan is missing or {self._config.user} lacks USAGE "
+                        f"in {self._config.dbname}. See scripts/db_v1_2/README.md."
+                    )
+                cur.execute(f"""
+                    SELECT count(*) FROM information_schema.tables
+                    WHERE table_schema = 'agroscan' AND table_type = 'BASE TABLE'
+                      AND table_name IN ({_TABLES})
+                      AND has_table_privilege(format('%I.%I', table_schema, table_name), 'SELECT')
+                """)
+                if cur.fetchone()[0] != 15:
+                    return False, "AgroScan v1.2 requires read access to all 15 agroscan tables."
+                cur.execute("SELECT id FROM agroscan.current_selections LIMIT 0")
+                cur.execute("SELECT lot_id FROM agroscan.latest_lot_decisions LIMIT 0")
+                cur.execute("SELECT inspection_id FROM agroscan.box_rule_counts LIMIT 0")
+            return True, f"Connected to {self._config.dbname} (agroscan v1.2)."
+        except ValueError as exc:
+            return False, str(exc)
 
-    # ------------------------------------------------------------------
-    # Properties matching MockRepository attributes
-    # ------------------------------------------------------------------
+    def account(self, login: str):
+        with self._connection() as conn, conn.cursor() as cur:
+            cur.execute("""
+                SELECT u.login, u.role, u.can_review, u.active, a.details->>'display_name',
+                       u.password_hash
+                FROM agroscan.users u
+                LEFT JOIN LATERAL (
+                    SELECT details FROM agroscan.audit_logs
+                    WHERE target_type = 'user' AND target_key = u.id::text
+                      AND action = 'workstation_account_saved'
+                    ORDER BY id DESC LIMIT 1
+                ) a ON true
+                WHERE u.login = %s
+            """, (login,))
+            row = cur.fetchone()
+        return (_user(*row[:-1]), row[-1]) if row else None
+
+    @property
+    def users(self) -> list[User]:
+        with self._connection() as conn, conn.cursor() as cur:
+            cur.execute("""
+                SELECT u.login, u.role, u.can_review, u.active, a.details->>'display_name'
+                FROM agroscan.users u
+                LEFT JOIN LATERAL (
+                    SELECT details FROM agroscan.audit_logs
+                    WHERE target_type = 'user' AND target_key = u.id::text
+                      AND action = 'workstation_account_saved'
+                    ORDER BY id DESC LIMIT 1
+                ) a ON true
+                ORDER BY u.login
+            """)
+            return [_user(*row) for row in cur.fetchall()]
+
+    def save_user(self, username, display_name, role, is_active=True, password=None, *, create_only=False) -> User:
+        name, label = username.strip().lower(), display_name.strip()
+        if not name or not label:
+            raise ValueError("Enter a username and display name.")
+        digest = hash_password(password) if password else None
+        db_role = "inspector" if role is Role.REVIEWER else role.name.lower()
+        with self._connection() as conn, conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, password_hash FROM agroscan.users WHERE login = %s FOR UPDATE
+            """, (name,))
+            existing = cur.fetchone()
+            if create_only and existing:
+                raise ValueError(f"Account {name} already exists.")
+            if existing and existing[0] < 0:
+                raise ValueError("Fixture accounts identify historical actors and cannot be edited here.")
+            if existing is None and digest is None:
+                raise ValueError("A new account requires a password.")
+            cur.execute("""
+                INSERT INTO agroscan.users (login, role, can_review, active, password_hash)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (login) DO UPDATE
+                SET role = EXCLUDED.role, can_review = EXCLUDED.can_review,
+                    active = EXCLUDED.active, password_hash = EXCLUDED.password_hash
+                WHERE users.id > 0 AND NOT %s
+                RETURNING id
+            """, (name, db_role, role is Role.REVIEWER, is_active, digest or existing[1], create_only))
+            saved = cur.fetchone()
+            if not saved:
+                raise ValueError(f"Account {name} already exists or is reserved.")
+            cur.execute("""
+                INSERT INTO agroscan.audit_logs (action, target_type, target_key, details)
+                VALUES ('workstation_account_saved', 'user', %s, %s)
+            """, (str(saved[0]), Json({"display_name": label})))
+        return User(name, label, role, is_active)
+
+    @staticmethod
+    def _product(code, name, category, settings, rules) -> Product:
+        config = (settings or {}).get("workstation_detector", {})
+        criteria = [
+            DefectCriterion(rule[0], float(rule[2] or 0), rule[1] == "exclusion", rule[3] or "gt")
+            for rule in rules
+        ]
+        return Product(
+            code.upper(), name, category, config.get("model_file", ""),
+            config.get("detect_classes", []), criteria, config.get("min_objects", 5),
+            config.get("min_confidence", 0.60),
+        )
+
+    def _fetch_products(self, conn):
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT p.code, p.name, p.category, f.applicability,
+                       coalesce(r.rules, '[]'::jsonb)
+                FROM agroscan.products p
+                LEFT JOIN LATERAL (
+                    SELECT id, applicability FROM agroscan.inspection_profiles
+                    WHERE product_id = p.id AND retired_at IS NULL
+                    ORDER BY version DESC LIMIT 1
+                ) f ON true
+                LEFT JOIN LATERAL (
+                    SELECT jsonb_agg(jsonb_build_array(code, rule_type, limit_ratio, operator)
+                                     ORDER BY id) AS rules
+                    FROM agroscan.quality_rules WHERE profile_id = f.id
+                ) r ON true
+                ORDER BY p.code
+            """)
+            return [self._product(*row) for row in cur.fetchall()]
 
     @property
     def products(self) -> list[Product]:
         with self._connection() as conn:
             return self._fetch_products(conn)
 
-    @property
-    def users(self) -> list[User]:
-        with self._connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT username, display_name, role, is_active
-                    FROM users
-                    ORDER BY username
-                    """
+    def find_product(self, code: str) -> Optional[Product]:
+        return next((p for p in self.products if p.code == code.strip().upper()), None)
+
+    def categories(self) -> list[str]:
+        return sorted({p.category for p in self.products})
+
+    def orders_for_product(self, code: str) -> list[Order]:
+        return [order for order in self.orders.values() if order.product.code == code]
+
+    def save_product(self, product: Product, original_code: Optional[str] = None) -> Product:
+        original = (original_code or product.code).upper()
+        errors = validate_product(product, [p.code for p in self.products if p.code != original])
+        if errors:
+            raise ValueError("\n".join(errors))
+        detector = {key: getattr(product, key) for key in (
+            "model_file", "detect_classes", "min_objects", "min_confidence"
+        )}
+        with self._connection() as conn, conn.cursor() as cur:
+            cur.execute("SELECT id, code FROM agroscan.products WHERE upper(code)=%s FOR UPDATE", (original,))
+            row = cur.fetchone()
+            if row:
+                product_id = row[0]
+                code = row[1] if original == product.code else product.code
+                cur.execute("""
+                    UPDATE agroscan.products SET code=%s, name=%s, category=%s WHERE id=%s
+                """, (code, product.name, product.category, product_id))
+            else:
+                cur.execute("""
+                    INSERT INTO agroscan.products (code, name, category) VALUES (%s,%s,%s) RETURNING id
+                """, (product.code, product.name, product.category))
+                product_id = cur.fetchone()[0]
+            cur.execute("""
+                INSERT INTO agroscan.inspection_profiles
+                    (product_id, version, reference, applicability)
+                SELECT %s, coalesce(max(version),0)+1, 'Workstation draft', %s
+                FROM agroscan.inspection_profiles WHERE product_id=%s
+                RETURNING id
+            """, (product_id, Json({"workstation_detector": detector}), product_id))
+            profile_id = cur.fetchone()[0]
+            cur.executemany("""
+                INSERT INTO agroscan.quality_rules
+                    (profile_id, code, rule_type, operator, limit_ratio, source_clause)
+                VALUES (%s,%s,%s,%s,%s,'Workstation draft')
+            """, [
+                (profile_id, c.defect_class, "exclusion" if c.is_critical else "ratio",
+                 None if c.is_critical else c.operator, None if c.is_critical else c.max_ratio)
+                for c in product.criteria
+            ])
+        return product
+
+    def delete_product(self, code: str) -> None:
+        with self._connection() as conn, conn.cursor() as cur:
+            cur.execute("SELECT id FROM agroscan.products WHERE upper(code)=%s FOR UPDATE", (code.upper(),))
+            row = cur.fetchone()
+            if not row:
+                raise ValueError(f"Product {code} was not found.")
+            product_id = row[0]
+            cur.execute("""
+                SELECT 1 FROM agroscan.inspection_profiles f
+                WHERE f.product_id=%s AND (f.approved OR EXISTS (
+                    SELECT FROM agroscan.lots WHERE profile_id=f.id
+                ))
+            """, (product_id,))
+            if cur.fetchone():
+                raise ValueError("This product has an approved or assigned profile.")
+            cur.execute("""
+                DELETE FROM agroscan.quality_rules WHERE profile_id IN (
+                    SELECT id FROM agroscan.inspection_profiles WHERE product_id=%s
                 )
-                return [
-                    User(
-                        username=row[0],
-                        display_name=row[1],
-                        role=_parse_role(row[2]),
-                        is_active=bool(row[3]),
-                    )
-                    for row in cur.fetchall()
-                ]
+            """, (product_id,))
+            cur.execute("DELETE FROM agroscan.inspection_profiles WHERE product_id=%s", (product_id,))
+            cur.execute("DELETE FROM agroscan.products WHERE id=%s", (product_id,))
+
+    def _fetch_orders(self, conn) -> dict[str, Order]:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT l.id, o.order_code, l.lot_code, count(*) OVER (PARTITION BY o.id),
+                       o.supplier, l.declared_boxes, o.imported_at, p.code, p.name, p.category,
+                       f.applicability, coalesce(r.rules, '[]'::jsonb),
+                       (a.details->>'expected_quantity')::int, d.outcome
+                FROM agroscan.lots l JOIN agroscan.orders o ON o.id=l.order_id
+                JOIN agroscan.inspection_profiles f ON f.id=l.profile_id
+                JOIN agroscan.products p ON p.id=f.product_id
+                LEFT JOIN agroscan.latest_lot_decisions d ON d.lot_id=l.id
+                LEFT JOIN LATERAL (
+                    SELECT jsonb_agg(jsonb_build_array(code, rule_type, limit_ratio, operator)
+                                     ORDER BY id) AS rules
+                    FROM agroscan.quality_rules WHERE profile_id=f.id
+                ) r ON true
+                LEFT JOIN LATERAL (
+                    SELECT details FROM agroscan.audit_logs
+                    WHERE target_type='order' AND target_key=o.id::text AND action='order_imported'
+                      AND details->'lot_id'=to_jsonb(l.id)
+                    ORDER BY id DESC LIMIT 1
+                ) a ON true
+                ORDER BY o.order_code, l.lot_code
+            """)
+            orders = {}
+            for lot_id, order_code, lot_code, count, supplier, boxes, imported, code, name, category, config, rules, quantity, outcome in cur.fetchall():
+                key = order_code if count == 1 else f"{order_code}:{lot_code}"
+                orders[key.upper()] = Order(
+                    key, self._product(code, name, category, config, rules),
+                    supplier or "", boxes, quantity, _local(imported),
+                    lot_id=lot_id, lot_code=lot_code, lot_outcome=outcome,
+                )
+            return orders
 
     @property
     def orders(self) -> dict[str, Order]:
         with self._connection() as conn:
             return self._fetch_orders(conn)
 
-    @property
-    def records(self) -> list[InspectionRecord]:
-        with self._connection() as conn:
-            return self._fetch_records(conn)
-
-    @property
-    def export_history(self) -> list[tuple[datetime, str, str, str]]:
-        return list(self._export_history)
-
-    def record_export(self, fmt: str, file_path: str, filter_summary: str = "All") -> None:
-        """Append an entry to export_history (T3.2)."""
-        self._export_history.insert(0, (datetime.now(), fmt, file_path, filter_summary))
-
-    # ------------------------------------------------------------------
-    # Internal loaders
-    # ------------------------------------------------------------------
-
-    def _fetch_products(self, conn: PgConnection) -> list[Product]:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT code, name, category, model_file, detect_classes, min_objects, min_confidence
-                FROM products
-                ORDER BY code
-                """
-            )
-            product_rows = cur.fetchall()
-
-            cur.execute(
-                """
-                SELECT product_code, defect_class, max_ratio, is_critical
-                FROM product_criteria
-                ORDER BY id
-                """
-            )
-            criteria_by_code: dict[str, list[DefectCriterion]] = defaultdict(list)
-            for prod_code, defect_cls, max_ratio, is_critical in cur.fetchall():
-                criteria_by_code[prod_code].append(
-                    DefectCriterion(
-                        defect_class=defect_cls,
-                        max_ratio=float(max_ratio),
-                        is_critical=bool(is_critical),
-                    )
-                )
-
-        products: list[Product] = []
-        for code, name, category, model_file, detect_classes, min_objects, min_conf in product_rows:
-            classes = list(_parse_json_field(detect_classes, []))
-            products.append(
-                Product(
-                    code=code,
-                    name=name,
-                    category=category,
-                    model_file=model_file,
-                    detect_classes=[str(c) for c in classes],
-                    criteria=criteria_by_code.get(code, []),
-                    min_objects=int(min_objects),
-                    min_confidence=float(min_conf),
-                )
-            )
-        return products
-
-    def _fetch_orders(self, conn: PgConnection) -> dict[str, Order]:
-        products_by_code = {p.code: p for p in self._fetch_products(conn)}
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT order_code, product_code, supplier, total_boxes, expected_quantity, created_at
-                FROM orders
-                ORDER BY created_at DESC, order_code
-                """
-            )
-            orders: dict[str, Order] = {}
-            for order_code, product_code, supplier, total_boxes, expected_qty, created_at in cur.fetchall():
-                product = products_by_code.get(product_code)
-                if product is None:
-                    continue
-                orders[order_code] = Order(
-                    order_code=order_code,
-                    product=product,
-                    supplier=supplier,
-                    total_boxes=int(total_boxes),
-                    expected_quantity=int(expected_qty),
-                    created_at=_to_local_naive(created_at) or datetime.now(),
-                )
-        return orders
-
-    def _fetch_records(
-        self, conn: PgConnection, box_code_filter: Optional[str] = None
-    ) -> list[InspectionRecord]:
-        orders_by_code = self._fetch_orders(conn)
-
-        query = """
-            SELECT
-                s.session_id, s.box_code, s.order_code, s.box_number, s.total_boxes,
-                s.inspector, s.station, s.status, s.notes, s.started_at,
-                r.total_objects, r.class_counts, r.mean_confidence,
-                r.recommendation, r.reasons, r.defect_ratios, r.deep_analysis,
-                r.decision, r.reviewer, r.review_notes, r.reviewed_at
-            FROM inspection_sessions s
-            INNER JOIN inspection_results r ON r.session_id = s.session_id
-        """
-        params: tuple[object, ...] = ()
-        if box_code_filter is not None:
-            query += " WHERE s.box_code = %s"
-            params = (box_code_filter,)
-        query += " ORDER BY s.started_at DESC, s.session_id DESC"
-
-        with conn.cursor() as cur:
-            cur.execute(query, params)
-            rows = cur.fetchall()
-            if not rows:
-                return []
-
-            session_ids = [row[0] for row in rows]
-            cur.execute(
-                """
-                SELECT session_id, captured_at, is_auto_capture, relative_path, sha256
-                FROM evidence_images
-                WHERE session_id = ANY(%s)
-                ORDER BY id
-                """,
-                (session_ids,),
-            )
-            evidence_by_session: dict[str, list[EvidenceImage]] = defaultdict(list)
-            for sid, captured_at, is_auto, rel_path, sha256 in cur.fetchall():
-                evidence_by_session[sid].append(
-                    EvidenceImage(
-                        captured_at=_to_local_naive(captured_at) or datetime.now(),
-                        is_auto_capture=bool(is_auto),
-                        relative_path=rel_path or "",
-                        sha256=sha256 or "",
-                    )
-                )
-
-        records: list[InspectionRecord] = []
-        for row in rows:
-            (
-                session_id,
-                _box_code_text,
-                order_code,
-                box_number,
-                total_boxes,
-                inspector,
-                station,
-                status_str,
-                notes,
-                started_at,
-                total_objects,
-                class_counts_raw,
-                mean_conf,
-                rec_str,
-                reasons_raw,
-                ratios_raw,
-                deep_raw,
-                decision_str,
-                reviewer,
-                review_notes,
-                reviewed_at,
-            ) = row
-
-            order = orders_by_code.get(order_code)
-            if order is None:
-                continue
-
-            box_code = BoxCode(order_code, int(box_number), int(total_boxes))
-            session = InspectionSession(
-                session_id=session_id,
-                box_code=box_code,
-                order=order,
-                inspector=inspector,
-                station=station,
-                status=SessionStatus(status_str),
-                notes=notes or "",
-                started_at=_to_local_naive(started_at) or datetime.now(),
-            )
-
-            class_counts = {
-                str(k): int(v)
-                for k, v in dict(_parse_json_field(class_counts_raw, {})).items()
-            }
-            detection = DetectionResult(
-                total_objects=int(total_objects),
-                class_counts=class_counts,
-                mean_confidence=float(mean_conf),
-                is_simulated=False,
-            )
-
-            reasons = [str(item) for item in list(_parse_json_field(reasons_raw, []))]
-            defect_ratios = {
-                str(k): float(v)
-                for k, v in dict(_parse_json_field(ratios_raw, {})).items()
-            }
-            assessment = QualityAssessmentResult(
-                recommendation=AiRecommendation(rec_str),
-                reasons=reasons,
-                defect_ratios=defect_ratios,
-                is_simulated=False,
-            )
-
-            deep_analysis: Optional[VlmAnalysis] = None
-            if deep_raw is not None:
-                parsed_deep = _parse_json_field(deep_raw, None)
-                if isinstance(parsed_deep, dict):
-                    try:
-                        deep_analysis = parse_vlm_response(parsed_deep)
-                    except VlmSchemaError:
-                        deep_analysis = None
-
-            review: Optional[ReviewRecord] = None
-            if decision_str is not None:
-                review = ReviewRecord(
-                    decision=ReviewerDecision(decision_str),
-                    reviewer=reviewer or "",
-                    notes=review_notes or "",
-                    reviewed_at=_to_local_naive(reviewed_at) or datetime.now(),
-                )
-
-            records.append(
-                InspectionRecord(
-                    session=session,
-                    evidence=evidence_by_session.get(session_id, []),
-                    detection=detection,
-                    assessment=assessment,
-                    deep_analysis=deep_analysis,
-                    review=review,
-                )
-            )
-        return records
-
-    # ------------------------------------------------------------------
-    # Catalog & orders
-    # ------------------------------------------------------------------
-
-    def find_product(self, code: str) -> Optional[Product]:
-        return next((p for p in self.products if p.code == code), None)
-
-    def categories(self) -> list[str]:
-        """Danh mục hàng hóa (Goods Category) đang dùng, sắp xếp A–Z."""
-        return sorted({p.category for p in self.products if p.category})
-
-    def orders_for_product(self, code: str) -> list[Order]:
-        return [o for o in self.orders.values() if o.product.code == code]
-
-    def save_product(self, product: Product, original_code: Optional[str] = None) -> Product:
-        """Thêm mới (``original_code=None``) hoặc cập nhật sản phẩm theo mã gốc."""
-        if original_code is not None and product.code != original_code:
-            raise ValueError("Product code cannot be changed after creation.")
-
-        current_products = self.products
-        others = [p.code for p in current_products if p.code != original_code]
-        errors = validate_product(product, others)
-        if errors:
-            raise ValueError("\n".join(errors))
-
-        with self._connection() as conn:
-            with conn.cursor() as cur:
-                if original_code is None:
-                    cur.execute(
-                        """
-                        INSERT INTO products (
-                            code, name, category, model_file,
-                            detect_classes, min_objects, min_confidence
-                        )
-                        VALUES (%s, %s, %s, %s, %s::jsonb, %s, %s)
-                        """,
-                        (
-                            product.code,
-                            product.name,
-                            product.category,
-                            product.model_file,
-                            json.dumps(product.detect_classes),
-                            product.min_objects,
-                            product.min_confidence,
-                        ),
-                    )
-                else:
-                    cur.execute("SELECT 1 FROM products WHERE code = %s", (original_code,))
-                    if cur.fetchone() is None:
-                        raise ValueError(f"Product {original_code} was not found.")
-                    cur.execute(
-                        """
-                        UPDATE products
-                        SET name = %s,
-                            category = %s,
-                            model_file = %s,
-                            detect_classes = %s::jsonb,
-                            min_objects = %s,
-                            min_confidence = %s
-                        WHERE code = %s
-                        """,
-                        (
-                            product.name,
-                            product.category,
-                            product.model_file,
-                            json.dumps(product.detect_classes),
-                            product.min_objects,
-                            product.min_confidence,
-                            original_code,
-                        ),
-                    )
-                    cur.execute(
-                        "DELETE FROM product_criteria WHERE product_code = %s",
-                        (original_code,),
-                    )
-
-                for criterion in product.criteria:
-                    cur.execute(
-                        """
-                        INSERT INTO product_criteria (
-                            product_code, defect_class, max_ratio, is_critical
-                        )
-                        VALUES (%s, %s, %s, %s)
-                        """,
-                        (
-                            product.code,
-                            criterion.defect_class,
-                            criterion.max_ratio,
-                            criterion.is_critical,
-                        ),
-                    )
-
-        saved = self.find_product(product.code)
-        if saved is None:
-            raise RuntimeError(f"Failed to reload saved product {product.code}.")
-        return saved
-
-    def delete_product(self, code: str) -> None:
-        """Xóa sản phẩm chưa có đơn hàng nào tham chiếu."""
-        product = self.find_product(code)
-        if product is None:
-            raise ValueError(f"Product {code} was not found.")
-        orders = self.orders_for_product(code)
-        if orders:
-            raise ValueError(
-                f"{product.name} is used by {len(orders)} order(s) "
-                f"({', '.join(o.order_code for o in orders)}) and cannot be deleted."
-            )
-        with self._connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute("DELETE FROM products WHERE code = %s", (code,))
-
-    def save_order(self, order: Order) -> Order:
-        """Insert or update an Order in PostgreSQL (T3.4)."""
-        code = order.order_code.strip().upper()
-        if not code:
-            raise ValueError("Order code cannot be empty.")
-        if order.total_boxes < 1:
-            raise ValueError("Total boxes must be >= 1.")
-        if order.expected_quantity < 1:
-            raise ValueError("Expected quantity must be >= 1.")
-        with self._connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO orders (
-                        order_code, product_code, supplier, total_boxes, expected_quantity, created_at
-                    )
-                    VALUES (%s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (order_code) DO UPDATE SET
-                        product_code = EXCLUDED.product_code,
-                        supplier = EXCLUDED.supplier,
-                        total_boxes = EXCLUDED.total_boxes,
-                        expected_quantity = EXCLUDED.expected_quantity
-                    """,
-                    (
-                        code,
-                        order.product.code,
-                        order.supplier.strip() or "Unknown Supplier",
-                        int(order.total_boxes),
-                        int(order.expected_quantity),
-                        order.created_at,
-                    ),
-                )
-        saved = self.orders.get(code)
-        if saved is None:
-            raise RuntimeError(f"Failed to reload saved order {code}.")
-        return saved
-
-    def import_orders(self, rows: list[dict[str, object]]) -> tuple[int, list[str]]:
-        """Validate and import a batch of orders into PostgreSQL (T3.4)."""
-        products_by_code = {p.code: p for p in self.products}
-        imported = 0
-        errors: list[str] = []
-        for idx, row in enumerate(rows, start=1):
-            order_code = str(row.get("order_code") or "").strip().upper()
-            product_code = str(row.get("product_code") or "").strip().upper()
-            supplier = str(row.get("supplier") or "").strip()
-            if not order_code or not product_code or not supplier:
-                errors.append(f"Row {idx}: Missing order_code, product_code, or supplier.")
-                continue
-            product = products_by_code.get(product_code)
-            if product is None:
-                errors.append(f"Row {idx} ({order_code}): Product '{product_code}' does not exist.")
-                continue
+    def import_orders(self, rows, *, actor="", source_file="") -> tuple[int, list[str]]:
+        imported, errors = 0, []
+        for index, row in enumerate(rows, 1):
             try:
-                total_boxes = int(str(row.get("total_boxes") or "0").strip())
-                expected_qty = int(str(row.get("expected_quantity") or "0").strip())
-                if total_boxes < 1 or expected_qty < 1:
-                    raise ValueError("Boxes and quantity must be positive integers.")
+                self._import_order(row, actor, source_file)
             except ValueError as exc:
-                errors.append(f"Row {idx} ({order_code}): {exc}")
-                continue
-
-            self.save_order(
-                Order(
-                    order_code=order_code,
-                    product=product,
-                    supplier=supplier,
-                    total_boxes=total_boxes,
-                    expected_quantity=expected_qty,
-                )
-            )
-            imported += 1
+                errors.append(f"Row {index}: {exc}")
+            else:
+                imported += 1
         return imported, errors
 
-    def save_user(
-        self,
-        username: str,
-        display_name: str,
-        role: Role,
-        is_active: bool = True,
-        password: Optional[str] = None,
-    ) -> User:
-        """Create or update a user account in PostgreSQL (T3.5)."""
-        import hashlib
-
-        name = username.strip().lower()
-        if not name:
-            raise ValueError("Username cannot be empty.")
-        if not display_name.strip():
-            raise ValueError("Display name cannot be empty.")
-
-        pw_hash: Optional[str] = None
-        if password is not None and password != "":
-            if len(password) < 4:
-                raise ValueError("Password must be at least 4 characters.")
-            digest = hashlib.pbkdf2_hmac(
-                "sha256", password.encode("utf-8"), name.encode("utf-8"), 260000
-            ).hex()
-            pw_hash = f"pbkdf2_sha256$260000${digest[:32]}"
-
-        with self._connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT password_hash FROM users WHERE username = %s", (name,))
-                row = cur.fetchone()
-                if row is None:
-                    effective_hash = pw_hash or f"pbkdf2_sha256$260000$default_{name}_hash"
-                    cur.execute(
-                        """
-                        INSERT INTO users (username, display_name, role, password_hash, is_active)
-                        VALUES (%s, %s, %s, %s, %s)
-                        """,
-                        (name, display_name.strip(), role.name, effective_hash, is_active),
-                    )
-                else:
-                    effective_hash = pw_hash or row[0]
-                    cur.execute(
-                        """
-                        UPDATE users
-                        SET display_name = %s,
-                            role = %s,
-                            password_hash = %s,
-                            is_active = %s
-                        WHERE username = %s
-                        """,
-                        (display_name.strip(), role.name, effective_hash, is_active, name),
-                    )
-        return User(
-            username=name,
-            display_name=display_name.strip(),
-            role=role,
-            is_active=is_active,
-        )
+    def _import_order(self, row, actor, source_file) -> None:
+        order = str(row.get("order_code") or "").strip().upper()
+        product = str(row.get("product_code") or "").strip().upper()
+        supplier = str(row.get("supplier") or "").strip()
+        if not (order and product and supplier and source_file):
+            raise ValueError("Order code, product, supplier and source file are required.")
+        BoxCode.parse(f"AGS:{order}-01/01")
+        try:
+            boxes = int(row.get("total_boxes") or 0)
+            quantity = int(row.get("expected_quantity") or 0)
+            if not 1 <= boxes <= 9999 or not 1 <= quantity <= 2147483647:
+                raise ValueError
+        except (ValueError, TypeError):
+            raise ValueError("Enter a box count from 1 to 9999 and a positive quantity.") from None
+        with self._connection() as conn, conn.cursor() as cur:
+            cur.execute("SELECT id FROM agroscan.users WHERE login=%s AND role='admin' AND active", (actor,))
+            user = cur.fetchone()
+            if not user:
+                raise ValueError("An active administrator is required to import orders.")
+            cur.execute("""
+                SELECT f.id FROM agroscan.inspection_profiles f JOIN agroscan.products p ON p.id=f.product_id
+                WHERE upper(p.code)=%s AND f.approved AND f.retired_at IS NULL
+                ORDER BY f.version DESC LIMIT 1
+            """, (product,))
+            profile = cur.fetchone()
+            if not profile:
+                raise ValueError(f"Product {product} needs an approved, active profile.")
+            cur.execute("""
+                INSERT INTO agroscan.orders (order_code,supplier,source_file)
+                VALUES (%s,%s,%s) ON CONFLICT (order_code) DO NOTHING RETURNING id
+            """, (order, supplier, source_file))
+            saved = cur.fetchone()
+            if not saved:
+                raise ValueError(f"Order {order} already exists.")
+            order_id = saved[0]
+            cur.execute("""
+                INSERT INTO agroscan.lots (order_id,profile_id,lot_code,declared_boxes)
+                VALUES (%s,%s,'LOT-01',%s) RETURNING id
+            """, (order_id, profile[0], boxes))
+            lot_id = cur.fetchone()[0]
+            cur.execute("""
+                INSERT INTO agroscan.boxes (lot_id,box_code)
+                SELECT %s, 'BOX-' || lpad(n::text,4,'0') FROM generate_series(1,%s) n
+            """, (lot_id, boxes))
+            cur.execute("""
+                INSERT INTO agroscan.audit_logs (actor_id,action,target_type,target_key,details)
+                VALUES (%s,'order_imported','order',%s,%s)
+            """, (user[0], str(order_id), Json({
+                "lot_id": lot_id, "declared_boxes": boxes, "expected_quantity": quantity
+            })))
 
     def resolve_box(self, text: str) -> tuple[BoxCode, Order]:
-        """Xác thực mã hộp quét được với danh sách đơn hàng."""
-        box_code = BoxCode.parse(text)
-        order = self.orders.get(box_code.order_code)
-        if order is None:
-            raise ValueError(f"Order {box_code.order_code} was not found.")
-        if order.total_boxes != box_code.total_boxes:
-            raise ValueError(
-                f"Box code says {box_code.total_boxes} boxes but order "
-                f"{order.order_code} has {order.total_boxes}."
+        with self._connection() as conn, conn.cursor() as cur:
+            orders = self._fetch_orders(conn)
+            try:
+                token = str(UUID(text.strip()))
+            except ValueError:
+                code = BoxCode.parse(text)
+                order = orders.get(code.order_code)
+                if order is None:
+                    raise ValueError(f"Order {code.order_code} was not found.")
+                if code.total_boxes != order.total_boxes:
+                    raise ValueError(f"Box code says {code.total_boxes} boxes but order has {order.total_boxes}.")
+                cur.execute(f"""
+                    WITH boxes AS ({_BOXES})
+                    SELECT 1 FROM boxes WHERE lot_id=%s AND box_number=%s
+                """, (order.lot_id, code.box_number))
+                if not cur.fetchone():
+                    raise ValueError("Box was not found in the lot register.")
+                return code, order
+            cur.execute(f"""
+                WITH boxes AS ({_BOXES})
+                SELECT lot_id,box_number FROM boxes WHERE scan_token=%s AND lot_id=ANY(%s)
+            """, (token, [order.lot_id for order in orders.values()]))
+            row = cur.fetchone()
+            if not row:
+                raise ValueError("Box scan token was not found.")
+            order = next(o for o in orders.values() if o.lot_id == row[0])
+            return BoxCode(order.order_code.upper(), row[1], order.total_boxes), order
+
+    @property
+    def records(self) -> list[InspectionRecord]:
+        with self._connection() as conn, conn.cursor() as cur:
+            orders = {order.lot_id: order for order in self._fetch_orders(conn).values()}
+            cur.execute(f"""
+                WITH boxes AS ({_BOXES})
+                SELECT i.id,b.lot_id,b.box_number,creator.login,i.station_code,i.state,
+                       coalesce((i.checkpoint->>'started_at')::timestamptz,
+                                ev.first_image,i.submitted_at,s.selected_at),
+                       i.machine_box_result,reviewer.login,i.review_note,i.reviewed_at,i.box_result,
+                       ev.images,coalesce(stats.num_objects,0), coalesce(stats.ratios,'{{}}'::jsonb),
+                       i.checkpoint->>'notes', submitted.details->'workstation_vlm_analysis',
+                       submitted.details->'workstation_vlm_simulated', ev.demo
+                FROM agroscan.inspections i
+                JOIN agroscan.sample_selections s ON s.id=i.selection_id
+                JOIN boxes b ON b.id=s.box_id
+                JOIN agroscan.users creator ON creator.id=i.inspector_id
+                LEFT JOIN agroscan.users reviewer ON reviewer.id=i.reviewer_id
+                LEFT JOIN LATERAL (
+                    SELECT min(im.received_at) AS first_image,
+                           bool_or(im.usage_context='demo') AS demo,
+                           array_agg(im.id ORDER BY g.batch_no, im.is_count_image DESC, im.id) AS images
+                    FROM agroscan.inspection_batches g
+                    JOIN agroscan.inspection_images im ON im.batch_id=g.id
+                    WHERE g.inspection_id=i.id
+                ) ev ON true
+                LEFT JOIN LATERAL (
+                    SELECT max(denominator) AS num_objects,
+                           jsonb_object_agg(code,machine_affected::numeric/nullif(denominator,0)) AS ratios
+                    FROM agroscan.box_rule_counts WHERE inspection_id=i.id
+                ) stats ON true
+                LEFT JOIN agroscan.audit_logs submitted
+                    ON submitted.target_type='inspection' AND submitted.target_key=i.id::text
+                       AND submitted.action='inspection_submitted'
+                WHERE b.lot_id=ANY(%s)
+                ORDER BY 7 DESC,i.attempt_no DESC,i.id DESC
+            """, (list(orders),))
+            rows = cur.fetchall()
+            cur.execute("""
+                SELECT id, coalesce(captured_at, received_at), object_key, sha256
+                FROM agroscan.inspection_images
+            """)
+            images = {
+                image_id: EvidenceImage(_local(timestamp), False, key, sha)
+                for image_id, timestamp, key, sha in cur.fetchall()
+            }
+        records = []
+        for row in rows:
+            (identifier, lot_id, number, inspector, station, state, started, result,
+             reviewer, notes, reviewed, verdict, image_ids, observed, ratios,
+             inspection_notes, vlm_payload, vlm_simulated, demo) = row
+            order = orders[lot_id]
+            session = InspectionSession(
+                f"INS-{identifier}", BoxCode(order.order_code.upper(), number, order.total_boxes),
+                order, inspector, station, _STATUS[state],
+                notes=inspection_notes or "", started_at=_local(started),
             )
-        return box_code, order
-
-    # ------------------------------------------------------------------
-    # Sessions & records
-    # ------------------------------------------------------------------
-
-    def create_session(
-        self, box_code: BoxCode, order: Order, inspector: str, station: str
-    ) -> InspectionSession:
-        prefix = f"INS-{datetime.now():%Y%m%d}-"
-        max_existing = 0
-        with self._connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT session_id FROM inspection_sessions WHERE session_id LIKE %s",
-                    (f"{prefix}%",),
-                )
-                for (sid,) in cur.fetchall():
-                    suffix = sid[len(prefix) :]
-                    if suffix.isdigit():
-                        max_existing = max(max_existing, int(suffix))
-        self._session_counter = max(self._session_counter, max_existing) + 1
-        session_id = f"{prefix}{self._session_counter:04d}"
-        return InspectionSession(session_id, box_code, order, inspector, station)
+            result = result or {}
+            evaluation = QualityAssessmentResult(
+                _RECOMMENDATION.get(result.get("outcome"), AiRecommendation.NEEDS_REVIEW),
+                [], {key: float(ratio) for key, ratio in ratios.items() if ratio is not None},
+                bool(demo),
+            )
+            decision = None
+            if reviewed:
+                outcome = {"conforming": ReviewerDecision.PASS, "nonconforming": ReviewerDecision.FAIL}
+                decision = ReviewRecord(outcome.get(verdict, ReviewerDecision.RE_INSPECT),
+                                        reviewer, notes or "", _local(reviewed))
+            detection = DetectionResult(
+                result.get("denominator", observed), result.get("class_counts", {}),
+                float(result.get("mean_confidence", 0.0)), is_simulated=bool(demo),
+            )
+            try:
+                vlm = parse_vlm_response(vlm_payload) if vlm_payload else None
+            except VlmSchemaError:
+                vlm = None
+            if vlm:
+                vlm.is_simulated = bool(vlm_simulated)
+            records.append(InspectionRecord(
+                session, [images[x] for x in image_ids or []], detection, evaluation,
+                deep_analysis=vlm, review=decision,
+            ))
+        return records
 
     def records_for_box(self, box_code: BoxCode) -> list[InspectionRecord]:
-        with self._connection() as conn:
-            return self._fetch_records(conn, box_code_filter=box_code.text)
+        return [record for record in self.records if record.session.box_code == box_code]
 
-    def submit_for_review(self, record: InspectionRecord) -> None:
-        """Lưu kết quả AI, phiên chuyển sang Pending Review (D-020)."""
-        record.session.status = SessionStatus.PENDING_REVIEW
-        session = record.session
-        detection = record.detection
-        assessment = record.assessment
-        deep_json = (
-            json.dumps(record.deep_analysis.to_dict())
-            if record.deep_analysis is not None
-            else None
+    def _active_attempt(self, cur, order, box_code, inspector):
+        cur.execute(f"""
+            WITH boxes AS ({_BOXES})
+            SELECT s.id, u.id, i.id, i.attempt_no, i.state,
+                   (p.applicability->>'scope'='demo' OR sr.verification->>'scope'='demo') IS TRUE,
+                   p.applicability
+            FROM boxes b JOIN agroscan.lots l ON l.id=b.lot_id
+            JOIN agroscan.current_selections s ON s.box_id=b.id
+            JOIN agroscan.inspection_profiles p ON p.id=l.profile_id
+            JOIN agroscan.sampling_rules sr ON sr.id=l.sampling_rule_id
+            JOIN agroscan.users u ON u.login=%s AND u.active AND u.role='inspector'
+            LEFT JOIN LATERAL (
+                SELECT id,attempt_no,state FROM agroscan.inspections WHERE selection_id=s.id
+                ORDER BY attempt_no DESC LIMIT 1
+            ) i ON true
+            WHERE l.id=%s AND b.box_number=%s AND l.declared_boxes=%s
+        """, (inspector, order.lot_id, box_code.box_number, box_code.total_boxes))
+        row = cur.fetchone()
+        if row is None:
+            raise ValueError("An active inspector and a box in the current sampling plan are required.")
+        return row
+
+    def create_session(self, box_code, order, inspector, station) -> InspectionSession:
+        with self._connection() as conn, conn.cursor() as cur:
+            _, _, _, _, state, demo, config = self._active_attempt(cur, order, box_code, inspector)
+            if state and state != "reinspect":
+                raise ValueError("The active sample already has an open or resolved inspection.")
+            if not demo and not config.get("workstation_detector", {}).get("model_file"):
+                raise ValueError("The assigned profile needs a configured detector.")
+        return InspectionSession(f"RUN-{uuid4().hex}", box_code, order, inspector, station)
+
+    def _insert_batch_evidence(self, cur, inspection_id, items, scope, model, product, operation):
+        cur.execute("""
+            INSERT INTO agroscan.inspection_batches (inspection_id,batch_no)
+            VALUES (%s,1) RETURNING id
+        """, (inspection_id,))
+        batch = cur.fetchone()[0]
+        for index, image in enumerate(items):
+            count_image = index == len(items) - 1
+            cur.execute("""
+                INSERT INTO agroscan.inspection_images
+                    (batch_id,is_count_image,object_key,sha256,width_px,height_px,captured_at,
+                     source_kind,usage_context)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id
+            """, (batch, count_image, image.relative_path, image.sha256, image.width_px,
+                  image.height_px, image.captured_at.astimezone(), image.source_kind, scope))
+            image_id = cur.fetchone()[0]
+        count = items[-1]
+        trusted = count.model_file == model and bool(model)
+        classes = Counter(unit.label for unit in count.units)
+        confidence = sum(unit.confidence for unit in count.units) / len(count.units)
+        cur.execute("""
+            INSERT INTO agroscan.audit_logs (action,target_type,target_key,details)
+            VALUES ('inference_result','image',%s,%s)
+        """, (str(image_id), Json({
+            "inspection_id": inspection_id, "execution_id": f"{operation}-detector",
+            "image_sha256": count.sha256, "stage": "detector", "model_version": count.model_file,
+            "prompt_version": None, "predicted_label": None, "route": "workstation_onnx",
+            "explanation_en": "Object detector executed on the count image.",
+            "confidence": confidence, "ocr": {"readability": "not_applicable"},
+            "schema_version": "1", "validation": "valid", "error": None,
+        })))
+        observations = []
+        for index, unit in enumerate(count.units, 1):
+            findings = []
+            for rule in product.criteria:
+                if trusted and unit.confidence >= product.min_confidence and unit.label == rule.defect_class:
+                    assessment = "present"
+                else:
+                    assessment = "uncertain"
+                findings.append({
+                    "code": rule.defect_class, "assessment": assessment,
+                    "detail": f"Detector class: {unit.label}, confidence: {unit.confidence:.3f}.",
+                })
+            warning = "red" if any(f["assessment"] == "present" for f in findings) else "yellow"
+            if not product.criteria:
+                warning = "green"
+            observations.append((
+                batch, image_id, index, unit.x, unit.y, unit.width, unit.height, Json(findings), warning,
+            ))
+        cur.executemany("""
+            INSERT INTO agroscan.observed_products
+                (batch_id,count_image_id,unit_no,x,y,width,height,ai_findings,warning)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        """, observations)
+        return batch, classes, confidence
+
+    @staticmethod
+    def _machine_result(cur, inspection_id, classes, confidence, denominator, too_few):
+        cur.execute("""
+            SELECT code,rule_type,operator,limit_ratio,machine_affected,
+                   CASE WHEN rule_type='exclusion' THEN machine_affected>0
+                        WHEN operator='gt' THEN machine_affected>limit_ratio*denominator
+                        ELSE machine_affected>=limit_ratio*denominator END
+            FROM agroscan.box_rule_counts WHERE inspection_id=%s ORDER BY code
+        """, (inspection_id,))
+        comparisons, exclusions = [], []
+        violated = False
+        for code, rule_type, operator, limit, affected, exceeds in cur.fetchall():
+            violated |= bool(exceeds)
+            if rule_type == "exclusion":
+                exclusions.append({"code": code, "present": bool(exceeds)})
+            else:
+                comparisons.append({
+                    "code": code, "affected": affected, "operator": operator,
+                    "limit_ratio": float(limit), "ratio": affected / denominator,
+                })
+        return {
+            "class_counts": classes, "denominator": denominator, "mean_confidence": confidence,
+            "comparisons": comparisons, "exclusions": exclusions,
+            "outcome": "nonconforming" if violated and not too_few else "needs_review",
+        }
+
+    def submit_for_review(self, record: InspectionRecord, *, coverage_confirmed=False) -> None:
+        items, session = record.evidence, record.session
+        if session.status == SessionStatus.PENDING_REVIEW:
+            return
+        if not coverage_confirmed or not items or not items[-1].units:
+            raise ValueError("Confirm whole-box coverage and capture a count image with detected objects.")
+        if any(image.width_px <= 0 or image.height_px <= 0 or not verify_evidence_integrity(image)
+               for image in items):
+            raise ValueError("Every original image must be saved and match its recorded SHA-256.")
+        with self._connection() as conn, conn.cursor() as cur:
+            # Lock the lot before re-reading the current selection and latest attempt.
+            cur.execute("SELECT id FROM agroscan.lots WHERE id=%s FOR UPDATE", (session.order.lot_id,))
+            selection, actor, previous, attempt_no, state, demo, config = self._active_attempt(
+                cur, session.order, session.box_code, session.inspector,
+            )
+            cur.execute("""
+                SELECT id, machine_box_result FROM agroscan.inspections
+                WHERE selection_id=%s AND checkpoint->>'operation_id'=%s AND state='submitted'
+            """, (selection, session.session_id))
+            saved = cur.fetchone()
+            if saved:
+                inspection_id, result = saved
+            else:
+                if state and state != "reinspect":
+                    raise ValueError("The current sample already has an open or resolved inspection.")
+                expected_model = config.get("workstation_detector", {}).get("model_file")
+                if not demo and (any(image.demo_image for image in items) or not expected_model
+                                 or items[-1].model_file != expected_model):
+                    raise ValueError("Operational inspections require original evidence and the assigned detector.")
+                detector = items[-1].model_file
+                if not detector:
+                    raise ValueError("A real detector execution is required on the count image.")
+                checkpoint = {
+                    "phase": "submitted", "operation_id": session.session_id,
+                    "started_at": session.started_at.astimezone().isoformat(), "notes": session.notes,
+                    "last_successful_stage": "rule_evaluation",
+                }
+                cur.execute("""
+                    INSERT INTO agroscan.inspections
+                        (selection_id,previous_id,inspector_id,attempt_no,station_code,ai_versions,checkpoint)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING id
+                """, (selection, previous, actor, (attempt_no or 0) + 1, session.station,
+                      Json({"detector": detector, "evaluation": "workstation-v1.2"}), Json(checkpoint)))
+                inspection_id = cur.fetchone()[0]
+                batch, classes, confidence = self._insert_batch_evidence(
+                    cur, inspection_id, items, "demo" if demo else "operational", expected_model,
+                    session.product, session.session_id,
+                )
+                denominator = len(items[-1].units)
+                result = self._machine_result(
+                    cur, inspection_id, classes, confidence, denominator,
+                    denominator < session.product.min_objects,
+                )
+                cur.execute("SELECT clock_timestamp()")
+                submitted = cur.fetchone()[0]
+                coverage = {
+                    "confirmed": True, "inspector_id": actor, "confirmed_at": submitted.isoformat(),
+                    "batch_ids": [batch],
+                }
+                cur.execute("""
+                    UPDATE agroscan.inspections
+                    SET state='submitted',submitted_at=%s,coverage=%s,machine_box_result=%s
+                    WHERE id=%s
+                """, (submitted, Json(coverage), Json(result), inspection_id))
+                details = {"operation_id": session.session_id}
+                if record.deep_analysis:
+                    details["workstation_vlm_analysis"] = record.deep_analysis.to_dict()
+                    details["workstation_vlm_simulated"] = record.deep_analysis.is_simulated
+                cur.execute("""
+                    INSERT INTO agroscan.audit_logs (actor_id,action,target_type,target_key,details,occurred_at)
+                    VALUES (%s,'inspection_submitted','inspection',%s,%s,%s)
+                """, (actor, str(inspection_id), Json(details), submitted))
+        session.session_id = f"INS-{inspection_id}"
+        session.status = SessionStatus.PENDING_REVIEW
+        record.assessment.recommendation = _RECOMMENDATION.get(
+            result["outcome"], AiRecommendation.NEEDS_REVIEW,
         )
 
-        with self._connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO inspection_sessions (
-                        session_id, box_code, order_code, box_number, total_boxes,
-                        inspector, station, status, notes, started_at
-                    )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (session_id) DO UPDATE SET
-                        status = EXCLUDED.status,
-                        notes = EXCLUDED.notes
-                    """,
-                    (
-                        session.session_id,
-                        session.box_code.text,
-                        session.order.order_code,
-                        session.box_code.box_number,
-                        session.box_code.total_boxes,
-                        session.inspector,
-                        session.station,
-                        session.status.value,
-                        session.notes,
-                        session.started_at,
-                    ),
-                )
-
-                cur.execute(
-                    "DELETE FROM evidence_images WHERE session_id = %s",
-                    (session.session_id,),
-                )
-                for ev in record.evidence:
-                    cur.execute(
-                        """
-                        INSERT INTO evidence_images (
-                            session_id, captured_at, is_auto_capture, relative_path, sha256
-                        )
-                        VALUES (%s, %s, %s, %s, %s)
-                        """,
-                        (
-                            session.session_id,
-                            ev.captured_at,
-                            ev.is_auto_capture,
-                            ev.relative_path,
-                            ev.sha256,
-                        ),
-                    )
-
-                cur.execute(
-                    """
-                    INSERT INTO inspection_results (
-                        session_id, total_objects, class_counts, mean_confidence,
-                        recommendation, reasons, defect_ratios, deep_analysis
-                    )
-                    VALUES (%s, %s, %s::jsonb, %s, %s, %s::jsonb, %s::jsonb, %s::jsonb)
-                    ON CONFLICT (session_id) DO UPDATE SET
-                        total_objects = EXCLUDED.total_objects,
-                        class_counts = EXCLUDED.class_counts,
-                        mean_confidence = EXCLUDED.mean_confidence,
-                        recommendation = EXCLUDED.recommendation,
-                        reasons = EXCLUDED.reasons,
-                        defect_ratios = EXCLUDED.defect_ratios,
-                        deep_analysis = EXCLUDED.deep_analysis
-                    """,
-                    (
-                        session.session_id,
-                        detection.total_objects,
-                        json.dumps(detection.class_counts),
-                        detection.mean_confidence,
-                        assessment.recommendation.value,
-                        json.dumps(assessment.reasons),
-                        json.dumps(assessment.defect_ratios),
-                        deep_json,
-                    ),
-                )
-
     def apply_review(self, record: InspectionRecord, review: ReviewRecord) -> None:
+        if not review.notes.strip():
+            raise ValueError("Enter a reason for this review.")
+        result = {ReviewerDecision.PASS: "conforming", ReviewerDecision.FAIL: "nonconforming"}
+        box_result = result.get(review.decision)
+        with self._connection() as conn, conn.cursor() as cur:
+            cur.execute("""
+                UPDATE agroscan.inspections i
+                SET state=%s, reviewer_id=u.id, reviewed_at=clock_timestamp(), box_result=%s, review_note=%s
+                FROM agroscan.users u
+                WHERE i.id=%s AND i.state='submitted' AND u.login=%s AND u.active AND u.can_review
+                RETURNING i.reviewed_at
+            """, ("reviewed" if box_result else "reinspect", box_result, review.notes.strip(),
+                  int(record.session_id.removeprefix("INS-")), review.reviewer))
+            row = cur.fetchone()
+            if not row:
+                raise ValueError("The attempt is no longer pending or this reviewer is unauthorized.")
+        review.reviewed_at = _local(row[0])
         record.review = review
         record.session.status = SessionStatus.COMPLETED
 
-        with self._connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    UPDATE inspection_sessions
-                    SET status = %s,
-                        completed_at = %s
-                    WHERE session_id = %s
-                    """,
-                    (
-                        record.session.status.value,
-                        review.reviewed_at,
-                        record.session_id,
-                    ),
-                )
-                cur.execute(
-                    """
-                    UPDATE inspection_results
-                    SET decision = %s,
-                        reviewer = %s,
-                        review_notes = %s,
-                        reviewed_at = %s
-                    WHERE session_id = %s
-                    """,
-                    (
-                        review.decision.value,
-                        review.reviewer,
-                        review.notes,
-                        review.reviewed_at,
-                        record.session_id,
-                    ),
-                )
+    @property
+    def export_history(self) -> list[tuple[datetime, str, str, str]]:
+        with self._connection() as conn, conn.cursor() as cur:
+            cur.execute("""
+                SELECT occurred_at,details->>'format',details->>'path',details->>'filter'
+                FROM agroscan.audit_logs WHERE action='workstation_export' ORDER BY id DESC
+            """)
+            return [(_local(ts), fmt, path, filters) for ts, fmt, path, filters in cur.fetchall()]
+
+    def record_export(self, fmt: str, file_path: str, filter_summary: str = "All") -> None:
+        with self._connection() as conn, conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO agroscan.audit_logs (action,target_type,target_key,details)
+                VALUES ('workstation_export','export',%s,%s)
+            """, (file_path, Json({"format": fmt, "path": file_path, "filter": filter_summary})))
 
     def pending_records(self) -> list[InspectionRecord]:
         pending = [r for r in self.records if r.status == SessionStatus.PENDING_REVIEW]
@@ -843,7 +791,7 @@ class PostgresRepository:
         for record in self.all_records():
             session = record.session
             day = session.started_at.date()
-            if needle and needle not in session.box_code.text and needle not in session.session_id:
+            if needle and needle not in session.box_code.text.upper() and needle not in session.session_id.upper():
                 continue
             if product_code and session.product.code != product_code:
                 continue

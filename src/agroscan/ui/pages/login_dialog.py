@@ -106,6 +106,7 @@ class LoginDialog(QDialog):
         root.addWidget(self.btn_sign_in)
         root.addSpacing(24)
 
+        demo_accounts = self._auth.demo_accounts()
         divider = QFrame()
         divider.setObjectName("FormDivider")
         divider.setFrameShape(QFrame.Shape.HLine)
@@ -119,7 +120,7 @@ class LoginDialog(QDialog):
 
         quick_row = QHBoxLayout()
         quick_row.setSpacing(10)
-        for user, password in self._auth.demo_accounts():
+        for user, password in demo_accounts:
             button = QPushButton(f"{user.role.value}\n{user.username}")
             button.setObjectName("QuickLoginButton")
             button.setFixedHeight(60)
@@ -128,7 +129,10 @@ class LoginDialog(QDialog):
                 lambda _=False, u=user.username, p=password: self._quick_sign_in(u, p)
             )
             quick_row.addWidget(button)
-        root.addLayout(quick_row)
+        divider.setVisible(bool(demo_accounts))
+        quick_title.setVisible(bool(demo_accounts))
+        if demo_accounts:
+            root.addLayout(quick_row)
         root.addStretch()
 
         footer = QHBoxLayout()
@@ -137,7 +141,7 @@ class LoginDialog(QDialog):
         self.btn_connection.setCursor(Qt.CursorShape.PointingHandCursor)
         footer.addWidget(self.btn_connection)
         footer.addStretch()
-        demo = QLabel("DEMO MODE")
+        demo = QLabel("DEMO MODE" if demo_accounts else "POSTGRESQL")
         demo.setObjectName("DemoBadge")
         footer.addWidget(demo)
         root.addLayout(footer)
