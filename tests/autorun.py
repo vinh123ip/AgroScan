@@ -82,6 +82,7 @@ from PySide6.QtWidgets import (  # noqa: E402
     QGraphicsDropShadowEffect,
     QHBoxLayout,
     QLabel,
+    QMessageBox,
     QScrollArea,
     QWidget,
 )
@@ -95,10 +96,7 @@ from agroscan.ui.components.qr_label_dialog import QrLabelDialog  # noqa: E402
 from agroscan.ui.main_window import MainWindow  # noqa: E402
 from agroscan.ui.navigation import PageKey  # noqa: E402
 from agroscan.ui.pages.login_dialog import LoginDialog  # noqa: E402
-from agroscan.ui.pages.settings_page import (  # noqa: E402
-    ConnectionSettingsDialog,
-    SettingsPage,
-)
+from agroscan.ui.pages.settings_page import SettingsPage  # noqa: E402
 from agroscan.ui.theme import apply_theme  # noqa: E402
 
 DEMO_BOX_CODE = "AGS:DH00124-01/08"
@@ -293,7 +291,6 @@ class AutorunController(QObject):
         self.repo = MockRepository(seed=42)
 
         self.login_dialog: Optional[LoginDialog] = None
-        self.conn_dialog: Optional[ConnectionSettingsDialog] = None
         self.qr_dialog: Optional[QrLabelDialog] = None
         self.main_window: Optional[MainWindow] = None
         self.hud: Optional[StepBadgeOverlay] = None
@@ -310,10 +307,7 @@ class AutorunController(QObject):
         self._tick_interval_ms = 20 if headless_check else 50
 
         if headless_check:
-            from agroscan.ui.pages.live_inspection_page import LiveInspectionPage
-
             MainWindow._LOADING_TRANSITION_MS = 20
-            LiveInspectionPage._DEEP_ANALYSIS_MS = 40
 
         self._step_timer = QTimer(self)
         self._step_timer.setInterval(self._tick_interval_ms)
@@ -571,11 +565,11 @@ class AutorunController(QObject):
             self._clear_sub_timers()
             self._detach_hud()
             QThreadPool.globalInstance().waitForDone(2500)
-            for dlg in (self.qr_dialog, self.conn_dialog, self.login_dialog):
+            for dlg in (self.qr_dialog, self.login_dialog):
                 if dlg is not None:
                     dlg.close()
                     dlg.deleteLater()
-            self.qr_dialog = self.conn_dialog = self.login_dialog = None
+            self.qr_dialog = self.login_dialog = None
             if self.main_window is not None:
                 if (
                     self.main_window.catalog_page is not None
@@ -657,11 +651,11 @@ class AutorunController(QObject):
         return [
             # Phase 1: Sign-In & Connection Setup (28s)
             AutoStep("Sign In",                     4_000, self._act_01_open_login),
-            AutoStep("Connection Settings",         9_000, self._act_02_preview_connection_dialog),
             AutoStep("Disabled Account Guard",      8_000, self._act_03_test_disabled_account),
             AutoStep("Inspector Session",           7_000, self._act_04_login_inspector),
             # Phase 2: Inspector Dashboard & Box Intake (37s)
             AutoStep("Inspector Dashboard & RBAC",  8_000, self._act_05_inspector_dashboard_rbac),
+            AutoStep("Switch EN / VI",              9_000, self._preview_language_switch),
             AutoStep("Box Intake — Barcode Check",  8_000, self._act_06_box_intake_barcode_error),
             AutoStep("QR Label Generator",          9_000, self._act_07_qr_dialog_and_scan),
             AutoStep("Order & Defect Criteria",    12_000, self._act_08_verify_criteria_and_start),
@@ -688,33 +682,10 @@ class AutorunController(QObject):
         dlg = self._open_login_dialog()
         dlg.setWindowTitle("AgroScan — Sign In")
 
-    def _act_02_preview_connection_dialog(self) -> None:
-        if self.login_dialog is None:
-            return
-
-        def open_conn() -> None:
-            if self.login_dialog is None:
-                return
-            self.conn_dialog = ConnectionSettingsDialog(self.settings, self.login_dialog)
-            self.conn_dialog.show()
-            self.conn_dialog.raise_()
-            scroll = self.conn_dialog.findChild(
-                QScrollArea, "DialogPage"
-            ) or self.conn_dialog.findChild(QScrollArea, "PageScrollArea")
-            self._later(2_600, lambda: self._smooth_scroll(scroll, 0.80, 750))
-            self._later(5_400, lambda: self._smooth_scroll(scroll, 0.0, 650))
-
-        def close_conn() -> None:
-            if self.conn_dialog is not None:
-                self.conn_dialog.close()
-                self.conn_dialog.deleteLater()
-                self.conn_dialog = None
-            if self.login_dialog is not None:
-                self.login_dialog._refresh_station_label()
-                self.login_dialog.raise_()
-
-        self._later(200, open_conn)
-        self._later(7_800, close_conn)
+    def _preview_language_switch(self) -> None:
+        if self.main_window is not None:
+            self._later(500, self.main_window.language_button.click)
+            self._later(6_000, self.main_window.language_button.click)
 
     def _act_03_test_disabled_account(self) -> None:
         dlg = self.login_dialog
@@ -824,7 +795,7 @@ class AutorunController(QObject):
                     supplier=live.session.order.supplier,
                     capture_index=index,
                 )
-                live._on_image_captured(index, sample)
+                live._capture_evidence(sample, "imported_image", True)
                 if not live._camera_active() and live._detection is not None:
                     total = live._detection.total_objects
                     live.realtime_total.setText(f"{total}")
@@ -860,6 +831,13 @@ class AutorunController(QObject):
         if self.main_window is None or self.main_window.live_inspection_page is None:
             return
         live = self.main_window.live_inspection_page
+        if live._is_analyzing:
+            # The accelerated walkthrough still waits for the bounded demo request.
+            from PySide6.QtTest import QTest
+            for _ in range(150):
+                if not live._is_analyzing:
+                    break
+                QTest.qWait(20)
         live._on_finish()
 
         result_page = self.main_window.assessment_result_page
@@ -868,7 +846,16 @@ class AutorunController(QObject):
         scroll = result_page.findChild(QScrollArea, "PageScrollArea")
         self._later(3_800, lambda: self._smooth_scroll(scroll, 0.55, 800))
         self._later(7_800, lambda: self._smooth_scroll(scroll, 1.0, 800))
-        self._later(11_200, result_page._on_submit)
+        def submit_demo_box():
+            def confirm_coverage():
+                dialog = self.app.activeModalWidget()
+                if isinstance(dialog, QMessageBox) and dialog.windowTitle() == "Confirm whole-box coverage":
+                    dialog.button(QMessageBox.StandardButton.Yes).click()
+
+            QTimer.singleShot(0, confirm_coverage)
+            result_page._on_submit()
+
+        self._later(11_200, submit_demo_box)
 
     def _act_12_switch_to_reviewer(self) -> None:
         dlg = self._open_login_dialog()

@@ -78,3 +78,4 @@ Mở `python run.py --demo` rồi chạy TC01–TC07 theo thứ tự cho một l
 - Trên Dashboard đối chiếu số thùng đã duyệt với số vị trí của kế hoạch mẫu hiện hành. Lô chưa khóa kế hoạch hiển thị dấu gạch ngang. Với lô mực mẫu, kiểm tra hai thùng đã duyệt, attempt tái kiểm cũ và quyết định chấp thuận ngoại lệ.
 - Trong History, tìm thùng theo mã rồi mở từng attempt. Reviewer có thể thêm ghi chú. Admin có thể xem nhật ký. Manager có thể tra cứu kết quả. Khi thử trên lô đã ký, đối chiếu phiên bản, lý do ngoại lệ và danh sách attempt trong bản kê trước và sau khi ghi chú.
 - Kiểm tra Qwen-VL vận hành bằng một ảnh gốc và một endpoint đã nạp mô hình. Test tự động chạy giao tiếp HTTP với đầu ra mô hình kiểm soát được. Kiểm tra SMB và suy luận trên máy chủ triển khai là hai phép thử riêng.
+- Chạy `python tests/autorun.py --headless-check` để tự động thực hiện 18 bước demo. Kịch bản kiểm tra phiên có phân tích sâu, quyết định Pass của Reviewer và thay đổi tiêu chí do Admin lưu.
