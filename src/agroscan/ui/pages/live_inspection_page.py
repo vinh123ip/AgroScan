@@ -9,12 +9,15 @@ realtime counts, detection results and deep analysis are simulated
 only — saving to SMB with SHA-256 (D-026) comes with the storage layer.
 """
 
+import atexit
 from collections import deque
 from datetime import datetime
+import logging
 from pathlib import Path
 from typing import Optional
+import weakref
 
-from PySide6.QtCore import QBuffer, QIODevice, Qt, QTimer, Signal
+from PySide6.QtCore import QBuffer, QIODevice, QObject, Qt, QTimer, Signal, Slot
 from PySide6.QtGui import QColor, QFont, QImage, QImageReader, QKeySequence, QPainter, QPen, QPixmap, QShortcut
 from PySide6.QtMultimedia import (
     QCamera,
@@ -60,6 +63,8 @@ from agroscan.services import mock_ai, rule_engine, vlm_client
 from agroscan.services.app_settings import AppSettings
 from agroscan.services.evidence_service import capture_and_save_evidence, load_evidence_qimage
 from agroscan.services.i18n import language_manager, tr
+from agroscan.services.container_classifier import ContainerCheckResult
+from agroscan.services.khang_ai_adapter import KhangAiAdapter
 from agroscan.services.yolo_engine import (
     YoloEngine,
     YoloInferenceOutput,
@@ -70,6 +75,110 @@ from agroscan.ui.components.evidence_strip import EvidenceStrip
 from agroscan.ui.components.page_layout import SectionCard, make_hint
 from agroscan.ui.components.status_badge import StatusBadge
 from agroscan.ui.components.vlm_result_panel import VlmResultPanel
+
+
+_LOG = logging.getLogger(__name__)
+_ACTIVE_PREVIEW_LIFETIMES: weakref.WeakSet["_PreviewLifetime"] = weakref.WeakSet()
+_ATEXIT_SHUTTING_DOWN = False
+
+
+class _PreviewLifetime(QObject):
+    """Keep preview QThreads parented safely outside LiveInspectionPage lifetime."""
+
+    def __init__(
+        self, engines: tuple[YoloEngine, ...], owner: Optional[QObject] = None
+    ) -> None:
+        app = QApplication.instance()
+        super().__init__(app)
+        self.workers = tuple(YoloInferenceThread(engine, self) for engine in engines)
+        self._closed = False
+        self._signals_disconnected = False
+        self._owner_ref = weakref.ref(owner) if owner is not None else None
+        _ACTIVE_PREVIEW_LIFETIMES.add(self)
+        if owner is not None:
+            owner.destroyed.connect(self.shutdown)
+        if app is not None:
+            app.aboutToQuit.connect(self.shutdown)
+
+    def stop(self, wait_ms: int = 5000, *, permanent: bool = False) -> None:
+        if self._closed:
+            return
+        for worker in self.workers:
+            try:
+                worker.stop_worker(wait_ms=0, permanent=permanent)
+            except RuntimeError:
+                pass
+        for worker in self.workers:
+            try:
+                if not worker.wait(wait_ms):
+                    raise RuntimeError("Could not join preview inference worker")
+            except RuntimeError as exc:
+                if "Could not join" in str(exc):
+                    raise
+
+    @Slot()
+    def shutdown(self, *, defer_delete: bool = True) -> None:
+        if self._closed:
+            return
+        if not self._signals_disconnected:
+            self._signals_disconnected = True
+            for worker in self.workers:
+                for sig in (worker.inference_ready, worker.inference_error):
+                    try:
+                        sig.disconnect()
+                    except (RuntimeError, TypeError):
+                        pass
+        unjoined: list[YoloInferenceThread] = []
+        for worker in self.workers:
+            try:
+                worker.stop_worker(wait_ms=0, permanent=True)
+            except RuntimeError:
+                pass
+        for worker in self.workers:
+            try:
+                if not worker.wait(10000):
+                    unjoined.append(worker)
+            except RuntimeError:
+                pass
+        if unjoined:
+            raise RuntimeError("Could not join preview inference worker")
+
+        owner = self._owner_ref() if self._owner_ref is not None else None
+        if owner is not None:
+            try:
+                owner.destroyed.disconnect(self.shutdown)
+            except (RuntimeError, TypeError):
+                pass
+        app = QApplication.instance()
+        if app is not None:
+            try:
+                app.aboutToQuit.disconnect(self.shutdown)
+            except (RuntimeError, TypeError):
+                pass
+        self._closed = True
+        if (
+            defer_delete
+            and not _ATEXIT_SHUTTING_DOWN
+            and app is not None
+            and not QApplication.closingDown()
+        ):
+            try:
+                self.deleteLater()
+            except RuntimeError:
+                pass
+
+
+def _shutdown_all_preview_lifetimes() -> None:
+    global _ATEXIT_SHUTTING_DOWN
+    _ATEXIT_SHUTTING_DOWN = True
+    for lifetime in list(_ACTIVE_PREVIEW_LIFETIMES):
+        try:
+            lifetime.shutdown(defer_delete=False)
+        except RuntimeError as exc:
+            _LOG.warning("Preview worker did not stop cleanly at exit: %s", exc)
+
+
+atexit.register(_shutdown_all_preview_lifetimes)
 
 
 class LiveInspectionPage(QWidget):
@@ -97,6 +206,18 @@ class LiveInspectionPage(QWidget):
         self._is_analyzing = False
         self._frame_history: dict[str, deque] = {}
 
+        # Request/session correlation and capture failure tracking
+        self._session_generation = 0
+        self._capture_requests: dict[int, tuple[int, str, BoxZone]] = {}
+        self._retired_capture_ids: dict[int, None] = {}
+        self._preview_revision = 0
+        self._preview_request_id = 0
+        self._last_completed_preview_id = 0
+        self._frame_token = 0
+        self._sim_frame_token = 0
+        self._preview_requests: dict[int, tuple[int, str, int, Optional[QImage]]] = {}
+        self._capture_analysis_error: Optional[str] = None
+
         # Simulation feed state (D-031)
         self._is_sim_mode: bool = False
         self._custom_original: Optional[tuple[bytes, str]] = None
@@ -106,7 +227,14 @@ class LiveInspectionPage(QWidget):
 
         # YOLOv8 ONNX Runtime engine & background QThread worker (T1.4)
         self._yolo_engine = YoloEngine()
-        self._yolo_worker = YoloInferenceThread(self._yolo_engine, self)
+        self._khang_adapter = KhangAiAdapter()
+        self._khang_apple_engine = YoloEngine()
+        self._preview_lifetime = _PreviewLifetime(
+            (self._yolo_engine, self._khang_apple_engine),
+            owner=self,
+        )
+        self._yolo_worker, self._khang_yolo_worker = self._preview_lifetime.workers
+        self._last_container_check: Optional[ContainerCheckResult] = None
 
         self._camera: Optional[QCamera] = None
         self._media_devices = QMediaDevices(self)
@@ -195,6 +323,20 @@ class LiveInspectionPage(QWidget):
 
         self.sim_controls_widget.setVisible(False)
         source_bar.addWidget(self.sim_controls_widget, 1)
+
+        self.apple_preset_label = QLabel("Apple Detector:")
+        self.apple_preset_label.setObjectName("FormLabel")
+        self.apple_preset_label.setVisible(False)
+        self.apple_preset_combo = QComboBox()
+        self.apple_preset_combo.setObjectName("FormCombo")
+        self.apple_preset_combo.addItem("🍎 Open Box (1280)", userData="open_box")
+        self.apple_preset_combo.addItem("🍎 Tray (960)", userData="tray")
+        self.apple_preset_combo.addItem("🧪 Baseline 3-Class", userData="baseline")
+        self.apple_preset_combo.setFixedWidth(185)
+        self.apple_preset_combo.setVisible(False)
+        source_bar.addWidget(self.apple_preset_label)
+        source_bar.addWidget(self.apple_preset_combo)
+
         source_bar.addStretch()
         column.addLayout(source_bar)
 
@@ -355,6 +497,16 @@ class LiveInspectionPage(QWidget):
         self._realtime_labels: dict[str, QLabel] = {}
         self.model_label = make_hint("")
         realtime.body.addWidget(self.model_label)
+        self.operational_model_label = QLabel("")
+        self.operational_model_label.setObjectName("WarningNote")
+        self.operational_model_label.setWordWrap(True)
+        self.operational_model_label.setVisible(False)
+        realtime.body.addWidget(self.operational_model_label)
+        self.container_advisory_label = QLabel("")
+        self.container_advisory_label.setObjectName("WarningNote")
+        self.container_advisory_label.setWordWrap(True)
+        self.container_advisory_label.setVisible(False)
+        realtime.body.addWidget(self.container_advisory_label)
         layout.addWidget(realtime)
 
         # Deep analysis (VLM Result Panel, schema 1.0)
@@ -410,15 +562,17 @@ class LiveInspectionPage(QWidget):
     def _connect_signals(self) -> None:
         self._media_devices.videoInputsChanged.connect(self._on_devices_changed)
         self._image_capture.imageCaptured.connect(self._on_image_captured)
-        self._image_capture.errorOccurred.connect(
-            lambda _id, _err, message: self.show_error(f"Capture failed — {message}")
-        )
+        self._image_capture.errorOccurred.connect(self._on_capture_error)
         self._image_capture.readyForCaptureChanged.connect(lambda _: self._update_buttons())
         self._realtime_timer.timeout.connect(self._on_realtime_tick)
         self._yolo_worker.inference_ready.connect(self._on_yolo_inference_ready)
+        self._yolo_worker.inference_error.connect(self._on_yolo_inference_error)
+        self._khang_yolo_worker.inference_ready.connect(self._on_yolo_inference_ready)
+        self._khang_yolo_worker.inference_error.connect(self._on_yolo_inference_error)
         self.btn_retry_camera.clicked.connect(self._start_camera)
         self.btn_switch_sim.clicked.connect(lambda: self.feed_mode_combo.setCurrentIndex(1))
         self.feed_mode_combo.currentIndexChanged.connect(self._on_feed_mode_changed)
+        self.apple_preset_combo.currentIndexChanged.connect(self._sync_apple_detector_preset)
         self.sim_sample_combo.currentIndexChanged.connect(self._on_sim_sample_changed)
         self.btn_load_custom.clicked.connect(self._on_browse_custom_image)
         self.btn_capture.clicked.connect(self._on_capture)
@@ -525,6 +679,10 @@ class LiveInspectionPage(QWidget):
         return list(self._images)
 
     def start_session(self, session: InspectionSession) -> None:
+        self._stop_camera()
+        self._session_generation += 1
+        self._capture_analysis_error = None
+
         self._session = session
         self._evidence, self._images = [], []
         self._detection, self._deep_analysis = None, None
@@ -542,9 +700,6 @@ class LiveInspectionPage(QWidget):
         self.btn_deep.setText(tr("live.deep_btn"))
         self.set_capture_zone(BoxZone.TOP)
         self._refresh_coverage_ui()
-        self._frame_history = {
-            cls: deque(maxlen=self._SMOOTHING_FRAMES) for cls in session.product.detect_classes
-        }
 
         self.session_label.setText(
             f"{session.session_id}   ·   Box {session.box_code}   ·   {session.product.name}"
@@ -561,10 +716,37 @@ class LiveInspectionPage(QWidget):
             )
             self.model_label.setText(f"Model: {session.product.model_file}  ({suffix})")
         else:
+            self._yolo_engine.unload()
             self.model_label.setText(
                 f"Model: {session.product.model_file}  (not loaded — simulated counts)"
             )
-        self._build_realtime_rows(session.product.detect_classes)
+        self._last_container_check = None
+        self.container_advisory_label.clear()
+        self.container_advisory_label.setVisible(False)
+        self._set_operational_model_warning(None)
+        is_apple_bundle = session.product.code.upper() == "APPLE" and self._khang_adapter.is_available()
+        self.apple_preset_label.setVisible(is_apple_bundle)
+        self.apple_preset_combo.setVisible(is_apple_bundle)
+        self.apple_preset_combo.blockSignals(True)
+        if is_apple_bundle:
+            assigned_model = session.product.model_file.strip()
+            if assigned_model == "apple_detector_tray.onnx":
+                desired_preset = "tray"
+            elif (
+                session.order.lot_id is not None
+                and assigned_model
+                and assigned_model not in ("apple_detector_open_box.onnx", "apple_detector_tray.onnx")
+            ):
+                # Operational PostgreSQL profile specifies a non-Khang detector; respect it to avoid submit rejection.
+                desired_preset = "baseline"
+            else:
+                desired_preset = "open_box"
+            idx = self.apple_preset_combo.findData(desired_preset)
+            if idx >= 0:
+                self.apple_preset_combo.setCurrentIndex(idx)
+        self.apple_preset_combo.blockSignals(False)
+        self._sync_apple_detector_preset()
+        self._sync_realtime_classes()
         self.evidence_strip.set_evidence([])
         self.vlm_panel.set_idle()
         self.deep_suggestion.setVisible(False)
@@ -577,6 +759,11 @@ class LiveInspectionPage(QWidget):
     def finalize(self) -> Optional[InspectionRecord]:
         """Đóng phiên hiện tại thành InspectionRecord; None nếu chưa có ảnh bằng chứng."""
         if self._session is None or not self._evidence or self._detection is None:
+            return None
+        model_error = self._submission_model_error()
+        if model_error:
+            self._set_operational_model_warning(model_error)
+            self.show_error(model_error)
             return None
         assessment = rule_engine.assess_quality(self._session.product, self._detection)
         audit = list(self._session_audit)
@@ -602,19 +789,126 @@ class LiveInspectionPage(QWidget):
         )
         return record
 
+    def _assigned_operational_model(self) -> Optional[str]:
+        if self._session is None or self._session.order.lot_id is None:
+            return None
+        assigned = self._session.product.model_file.strip()
+        return assigned or None
+
+    def _operational_warning_text(self) -> Optional[str]:
+        assigned = self._assigned_operational_model()
+        if assigned is None:
+            return None
+        engine = self._khang_apple_engine if self._use_khang_apple_detector() else self._yolo_engine
+        actual = engine.model_path.name if engine.is_loaded and engine.model_path is not None else None
+        if actual == assigned:
+            return None
+        return (
+            f"DB profile expects '{assigned}'; selected detector is "
+            f"'{actual or 'not loaded'}'. Select/load the assigned detector "
+            "before running operational analysis."
+        )
+
+    def _model_assignment_error(self, *, demo: bool) -> Optional[str]:
+        if demo:
+            return None
+        return self._operational_warning_text()
+
+    def _submission_model_error(self) -> Optional[str]:
+        assigned = self._assigned_operational_model()
+        if assigned is None:
+            return None
+        if any((not item.demo_image) and item.model_file != assigned for item in self._evidence):
+            return (
+                f"DB profile expects '{assigned}'; captured evidence uses "
+                "a different or unverified detector. Recapture with the "
+                "assigned detector before submission."
+            )
+        return None
+
+    def _set_operational_model_warning(self, message: Optional[str]) -> None:
+        self.operational_model_label.setText(message or "")
+        self.operational_model_label.setVisible(bool(message))
+
+    def _use_khang_apple_detector(self) -> bool:
+        return (
+            self._session is not None
+            and self._session.product.code.upper() == "APPLE"
+            and self.apple_preset_combo.currentData() in ("open_box", "tray")
+            and self._khang_apple_engine.is_loaded
+        )
+
+    def _sync_realtime_classes(self) -> None:
+        if self._session is None:
+            self._frame_history.clear()
+            self._build_realtime_rows([])
+            self.realtime_total.setText("—")
+            return
+        classes = (
+            ["apple"]
+            if (self._use_khang_apple_detector() and not self._is_sim_mode)
+            else list(self._session.product.detect_classes)
+        )
+        self._frame_history = {cls: deque(maxlen=self._SMOOTHING_FRAMES) for cls in classes}
+        self._build_realtime_rows(classes)
+        self.realtime_total.setText("—")
+
+    def _sync_apple_detector_preset(self) -> None:
+        self._invalidate_preview()
+        self._preview_lifetime.stop()
+        preset = self.apple_preset_combo.currentData()
+        if (
+            self._session is None
+            or self._session.product.code.upper() != "APPLE"
+            or not self._khang_adapter.is_available()
+            or preset not in ("open_box", "tray")
+        ):
+            self._khang_apple_engine.unload()
+            if self._session is not None and self._session.product.code.upper() == "APPLE":
+                if self._yolo_engine.is_loaded:
+                    loaded_name = self._yolo_engine.model_path.name if self._yolo_engine.model_path else self._session.product.model_file
+                    self.model_label.setText(f"Model: {loaded_name} (ONNX Runtime loaded)")
+                self._sync_realtime_classes()
+            self._set_operational_model_warning(self._operational_warning_text())
+            self._update_buttons()
+            return
+        try:
+            meta = self._khang_adapter.load_detector_preset(self._khang_apple_engine, str(preset))
+            self.model_label.setText(
+                f"Model: {meta['model_file']} ({preset} · {meta['image_size']}px ONNX)"
+            )
+        except Exception as exc:
+            self._khang_apple_engine.unload()
+            self.model_label.setText(f"Apple ONNX preset unavailable: {exc}")
+        self._sync_realtime_classes()
+        self._set_operational_model_warning(self._operational_warning_text())
+        self._update_buttons()
+
     def clear_session(self) -> None:
+        self._stop_camera()
+        self._session_generation += 1
+        self._capture_analysis_error = None
         self._session = None
         self._evidence.clear()
         self._images.clear()
         self._session_audit.clear()
         self._detection = self._deep_analysis = None
+        self._last_container_check = None
+        self._khang_apple_engine.unload()
+        self.apple_preset_label.setVisible(False)
+        self.apple_preset_combo.setVisible(False)
+        self.container_advisory_label.clear()
+        self.container_advisory_label.setVisible(False)
+        self._set_operational_model_warning(None)
+        self._frame_history.clear()
+        self._build_realtime_rows([])
+        self.realtime_total.setText("—")
         self.evidence_strip.set_evidence([])
         self._refresh_coverage_ui()
         self._analysis_token += 1
         self._is_analyzing = False
         self.btn_deep.setText(tr("live.deep_btn"))
         self.vlm_panel.set_idle()
-        self._stop_camera()
         self.session_label.setText("No active session")
         self.status_badge.set_value(None)
         self._set_session_widgets_enabled(False)
@@ -665,9 +959,22 @@ class LiveInspectionPage(QWidget):
         self._realtime_timer.start()
         self._update_buttons()
 
+    def _retire_capture_id(self, request_id: int) -> None:
+        if request_id < 0:
+            return
+        self._retired_capture_ids.pop(request_id, None)
+        self._retired_capture_ids[request_id] = None
+        while len(self._retired_capture_ids) > 256:
+            oldest = next(iter(self._retired_capture_ids))
+            self._retired_capture_ids.pop(oldest, None)
+
     def _stop_camera(self) -> None:
         self._realtime_timer.stop()
-        self._yolo_worker.stop_worker(wait_ms=500)
+        self._invalidate_preview()
+        for rid in self._capture_requests:
+            self._retire_capture_id(rid)
+        self._capture_requests.clear()
+        self._preview_lifetime.stop()
         if self._camera is not None:
             self._camera.stop()
             self._capture_session.setCamera(None)
@@ -727,26 +1034,120 @@ class LiveInspectionPage(QWidget):
                 share = value / total if total else 0
                 self._realtime_labels[cls].setText(f"{value:.0f}   ({share:.0%})")
 
-    def _on_yolo_inference_ready(self, output: YoloInferenceOutput) -> None:
-        if self._session is None:
+    def _invalidate_preview(self) -> None:
+        self._preview_revision += 1
+        self._last_completed_preview_id = 0
+        self._preview_requests.clear()
+
+    def _preview_detector_tag(self) -> str:
+        role = (
+            "khang"
+            if self._use_khang_apple_detector() and not self._is_sim_mode
+            else "baseline"
+        )
+        return f"{role}:{self._preview_revision}"
+
+    def _submit_preview(self, image: QImage, *, simulation: bool) -> None:
+        if self._session is None or simulation != self._is_sim_mode or image.isNull():
             return
-        self._apply_realtime_counts(output.detection.class_counts)
-        if self._is_sim_mode and self._current_raw_sim_image is not None:
-            self._current_sim_image = draw_detections_on_qimage(
-                self._current_raw_sim_image,
-                output.boxes,
-                fps_text=f"ONNX · {output.inference_ms:.1f} ms",
-            )
-            pixmap = QPixmap.fromImage(self._current_sim_image)
-            scaled = pixmap.scaled(
+        if self._model_assignment_error(demo=simulation):
+            return
+
+        use_khang = self._use_khang_apple_detector() and not simulation
+        engine = self._khang_apple_engine if use_khang else self._yolo_engine
+        worker = self._khang_yolo_worker if use_khang else self._yolo_worker
+        if not engine.is_loaded:
+            return
+
+        tag = self._preview_detector_tag()
+        for request_id, context in list(self._preview_requests.items()):
+            if context[1] != tag:
+                del self._preview_requests[request_id]
+        while len(self._preview_requests) >= 8:
+            keys = iter(self._preview_requests)
+            next(keys)  # Preserve oldest in-flight request while capping pending queue
+            self._preview_requests.pop(next(keys), None)
+
+        if simulation:
+            frame_token = self._sim_frame_token
+            raw_frame = image.copy()
+        else:
+            self._frame_token += 1
+            frame_token = self._frame_token
+            raw_frame = None
+
+        self._preview_request_id += 1
+        request_id = self._preview_request_id
+        self._preview_requests[request_id] = (
+            self._session_generation,
+            tag,
+            frame_token,
+            raw_frame,
+        )
+        try:
+            worker.submit_frame(image, track=not use_khang, request_id=request_id)
+        except Exception:
+            self._preview_requests.pop(request_id, None)
+            _LOG.exception("Could not submit preview inference")
+
+    def _show_sim_image(self, image: QImage) -> None:
+        self._current_sim_image = image
+        pixmap = QPixmap.fromImage(image)
+        self.sim_frame_label.setPixmap(
+            pixmap.scaled(
                 self.sim_frame_label.size(),
                 Qt.AspectRatioMode.KeepAspectRatio,
                 Qt.TransformationMode.SmoothTransformation,
             )
-            self.sim_frame_label.setPixmap(scaled)
+        )
+
+    def _on_yolo_inference_error(self, *args) -> None:
+        _LOG.warning(
+            "Preview inference failed: %s",
+            " | ".join(str(arg) for arg in args),
+        )
+
+    def _on_yolo_inference_ready(self, output: YoloInferenceOutput) -> None:
+        context = self._preview_requests.pop(output.request_id, None)
+        if context is None or self._session is None:
+            return
+        if output.request_id < self._last_completed_preview_id:
+            return
+
+        generation, detector_tag, frame_token, raw_frame = context
+        if (
+            generation != self._session_generation
+            or detector_tag != self._preview_detector_tag()
+        ):
+            return
+
+        if raw_frame is not None:
+            if not self._is_sim_mode or frame_token != self._sim_frame_token:
+                return
+        elif self._is_sim_mode:
+            return
+
+        if self._model_assignment_error(demo=raw_frame is not None):
+            return
+
+        self._last_completed_preview_id = output.request_id
+        for stale_id in [rid for rid in self._preview_requests if rid < output.request_id]:
+            del self._preview_requests[stale_id]
+
+        self._apply_realtime_counts(output.detection.class_counts)
+        if raw_frame is not None:
+            self._show_sim_image(
+                draw_detections_on_qimage(
+                    raw_frame,
+                    output.boxes,
+                    fps_text=f"ONNX · {output.inference_ms:.1f} ms",
+                )
+            )
 
     def _on_realtime_tick(self) -> None:
         if self._session is None:
+            return
+        if self._model_assignment_error(demo=self._is_sim_mode):
             return
         if not self._camera_active() and not self._is_sim_mode:
             return
@@ -756,13 +1157,13 @@ class LiveInspectionPage(QWidget):
             and self._yolo_engine.is_loaded
             and self._current_raw_sim_image is not None
         ):
-            self._yolo_worker.submit_frame(self._current_raw_sim_image, track=True)
+            self._submit_preview(self._current_raw_sim_image, simulation=True)
             return
 
         if not self._is_sim_mode:
             frame = self.video_widget.videoSink().videoFrame()
-            if frame.isValid() and self._yolo_engine.is_loaded:
-                self._yolo_worker.submit_frame(frame.toImage(), track=True)
+            if frame.isValid():
+                self._submit_preview(frame.toImage(), simulation=False)
             return
         scenario = self.sim_sample_combo.currentData()
         if scenario == "custom":
@@ -783,6 +1184,13 @@ class LiveInspectionPage(QWidget):
     # ------------------------------------------------------------------
 
     def _on_capture(self) -> None:
+        if self._session is None:
+            return
+        model_error = self._model_assignment_error(demo=self._is_sim_mode)
+        if model_error:
+            self._set_operational_model_warning(model_error)
+            self.show_error(model_error)
+            return
         if self._is_sim_mode:
             if self._current_raw_sim_image is None:
                 self._update_sim_frame()
@@ -798,18 +1206,69 @@ class LiveInspectionPage(QWidget):
         if not self._image_capture.isReadyForCapture():
             self.show_error("Camera is not ready yet — try again in a moment.")
             return
-        self._image_capture.capture()
+        context = (
+            self._session_generation,
+            self._session.session_id,
+            self.current_capture_zone(),
+        )
+        request_id = self._image_capture.capture()
+        if request_id < 0:
+            self.show_error("Camera rejected the capture request.")
+            return
+        self._retired_capture_ids.pop(request_id, None)
+        self._capture_requests[request_id] = context
 
-    def _on_image_captured(self, _request_id: int, image: QImage) -> None:
+    def _on_image_captured(self, request_id: int, image: QImage) -> None:
+        if self._session is None:
+            for rid in self._capture_requests:
+                self._retire_capture_id(rid)
+            self._capture_requests.clear()
+            self._retire_capture_id(request_id)
+            return
+        context = self._capture_requests.pop(request_id, None)
+        if context is not None:
+            self._retire_capture_id(request_id)
+            generation, session_id, captured_zone = context
+            if generation != self._session_generation or session_id != self._session.session_id:
+                return
+            self._capture_evidence(image, "camera", False, captured_zone=captured_zone)
+            return
+        if (
+            self._camera is not None
+            or self._is_sim_mode
+            or request_id in self._retired_capture_ids
+            or bool(self._capture_requests)
+        ):
+            return
         self._capture_evidence(image, "camera", False)
 
-    def _capture_evidence(self, image: QImage, source: str, demo: bool,
-                          original: Optional[tuple[bytes, str]] = None) -> None:
+    def _on_capture_error(self, request_id: int, _error, message: str) -> None:
+        context = self._capture_requests.pop(request_id, None)
+        if request_id >= 0:
+            self._retire_capture_id(request_id)
         if self._session is None:
+            return
+        if context is None:
+            if request_id < 0:
+                self.show_error(f"Capture failed — {message}")
+            return
+        generation, session_id, _zone = context
+        if generation == self._session_generation and session_id == self._session.session_id:
+            self.show_error(f"Capture failed — {message}")
+
+    def _capture_evidence(self, image: QImage, source: str, demo: bool,
+                          original: Optional[tuple[bytes, str]] = None,
+                          *, captured_zone: Optional[BoxZone] = None) -> None:
+        if self._session is None:
+            return
+        model_error = self._model_assignment_error(demo=demo)
+        if model_error:
+            self._set_operational_model_warning(model_error)
+            self.show_error(model_error)
             return
 
         # T1.6 / D-026 / 3.4.5.1: Hash SHA-256 on raw image bytes and tag box surface zone
-        zone = self.current_capture_zone()
+        zone = captured_zone if captured_zone is not None else self.current_capture_zone()
         try:
             item = capture_and_save_evidence(
                 raw_image=original[0] if original else image,
@@ -828,24 +1287,81 @@ class LiveInspectionPage(QWidget):
         item.source_kind = source
         item.demo_image = demo
         display_image = image
-        if self._yolo_engine.is_loaded:
-            yolo_out = self._yolo_engine.infer(image, track=True)
-            item.model_file = self._yolo_engine.model_path.name
-            item.units = [
-                DetectedUnit(box.x1, box.y1, box.width, box.height, box.label, box.confidence)
-                for box in yolo_out.boxes if box.width > 0 and box.height > 0
-            ]
-            if yolo_out.detection.total_objects > 0:
+        self._detection = None
+        self._last_container_check = None
+        self._capture_analysis_error = None
+        try:
+            if not demo and self._use_khang_apple_detector():
+                try:
+                    precheck = self._khang_adapter.check_apple_container(
+                        image, scene_condition="single_product"
+                    )
+                    self._last_container_check = precheck
+                    if precheck.status == "MATCH":
+                        self.container_advisory_label.setText(
+                            f"ResNet18 Pre-Check: {precheck.predicted_label} ({precheck.confidence:.0%}) · advisory"
+                        )
+                    else:
+                        self.container_advisory_label.setText(
+                            f"▲ Advisory Pre-Check: predicted '{precheck.predicted_label}' "
+                            f"({precheck.confidence:.0%}, {precheck.status}) — verify container is APPLE."
+                        )
+                    self.container_advisory_label.setVisible(True)
+                    self._session_audit.append(
+                        AuditEvent(
+                            action="Container Pre-Check (ResNet18)",
+                            actor=self._session.inspector,
+                            role="Inspector",
+                            timestamp=item.captured_at,
+                            details=(
+                                f"status={precheck.status}, label={precheck.predicted_label}, "
+                                f"conf={precheck.confidence:.3f} (advisory)"
+                            ),
+                        )
+                    )
+                except Exception as exc:
+                    self._last_container_check = None
+                    self.container_advisory_label.setText(f"ResNet18 Pre-Check skipped: {exc}")
+                    self.container_advisory_label.setVisible(True)
+
+                yolo_out = self._khang_apple_engine.infer(image, track=False)
+                if self._khang_apple_engine.model_path is not None:
+                    item.model_file = self._khang_apple_engine.model_path.name
+                item.units = [
+                    DetectedUnit(box.x1, box.y1, box.width, box.height, box.label, box.confidence)
+                    for box in yolo_out.boxes if box.width > 0 and box.height > 0
+                ]
                 self._detection = yolo_out.detection
+                self.realtime_total.setText(str(yolo_out.detection.total_objects))
                 display_image = draw_detections_on_qimage(
                     image,
                     yolo_out.boxes,
-                    fps_text=f"ONNX · {yolo_out.inference_ms:.1f} ms",
+                    fps_text=f"Apple ONNX · {yolo_out.inference_ms:.1f} ms",
                 )
+            elif self._yolo_engine.is_loaded:
+                yolo_out = self._yolo_engine.infer(image, track=True)
+                if self._yolo_engine.model_path is not None:
+                    item.model_file = self._yolo_engine.model_path.name
+                item.units = [
+                    DetectedUnit(box.x1, box.y1, box.width, box.height, box.label, box.confidence)
+                    for box in yolo_out.boxes if box.width > 0 and box.height > 0
+                ]
+                if yolo_out.detection.total_objects > 0:
+                    self._detection = yolo_out.detection
+                    display_image = draw_detections_on_qimage(
+                        image,
+                        yolo_out.boxes,
+                        fps_text=f"ONNX · {yolo_out.inference_ms:.1f} ms",
+                    )
+                else:
+                    self._detection = self._fallback_detection() if item.demo_image else yolo_out.detection
             else:
-                self._detection = self._fallback_detection() if item.demo_image else yolo_out.detection
-        else:
-            self._detection = self._fallback_detection() if item.demo_image else DetectionResult(0, {}, 0.0)
+                self._detection = self._fallback_detection() if item.demo_image else DetectionResult(0, {}, 0.0)
+        except Exception as exc:
+            self._detection = None
+            item.units = []
+            display_image = image.copy()
+            self._capture_analysis_error = f"{type(exc).__name__}: {exc}"
 
         self._analysis_token += 1
         self._is_analyzing = False
@@ -867,8 +1383,37 @@ class LiveInspectionPage(QWidget):
         self._refresh_coverage_ui()
         self._advance_to_next_uncovered_zone()
 
+        if self._capture_analysis_error is not None:
+            message = (
+                "Original evidence saved; detection analysis failed. "
+                "Capture again before finishing."
+            )
+            self._session_audit.append(
+                AuditEvent(
+                    action="Evidence Analysis Failed",
+                    actor=self._session.inspector,
+                    role="Inspector",
+                    timestamp=datetime.now(),
+                    details=f"status=FAILED; zone={zone.value}; error={self._capture_analysis_error}",
+                )
+            )
+            self.realtime_total.setText("—")
+            self.vlm_panel.set_idle(message)
+            self.deep_suggestion.setText(f"▲ {message}")
+            self.deep_suggestion.setVisible(True)
+            self.show_error(f"{message} {self._capture_analysis_error}")
+            self._update_buttons()
+            return
+
         low_confidence = self._detection.mean_confidence < self._session.product.min_confidence
-        self.deep_suggestion.setVisible(low_confidence)
+        count_only = not self._detection.defect_classification_available
+        if count_only:
+            self.deep_suggestion.setText(
+                "▲  Count-only Apple detector active — run Deep Analysis (Qwen-VL) / manual review for defects."
+            )
+        else:
+            self.deep_suggestion.setText("▲  Low detection confidence — deep analysis recommended.")
+        self.deep_suggestion.setVisible(low_confidence or count_only)
         self._update_buttons()
 
     def _fallback_detection(self) -> DetectionResult:
@@ -943,7 +1488,14 @@ class LiveInspectionPage(QWidget):
     def _on_finish(self) -> None:
         record = self.finalize()
         if record is None:
-            self.show_error("Capture at least one evidence image before finishing.")
+            self.show_error(
+                self._submission_model_error()
+                or (
+                    "Original evidence saved, but detection analysis failed. Capture again."
+                    if self._capture_analysis_error
+                    else "Capture at least one evidence image before finishing."
+                )
+            )
             return
         self._stop_camera()
         self.inspection_finished.emit(record)
@@ -951,6 +1503,11 @@ class LiveInspectionPage(QWidget):
     def _on_next_scanned(self) -> None:
         text = self.next_scan_field.text().strip()
         if text:
+            model_error = self._submission_model_error()
+            if model_error:
+                self._set_operational_model_warning(model_error)
+                self.show_error(model_error)
+                return
             self.next_scan_field.clear()
             self.next_box_scanned.emit(text)
 
@@ -975,8 +1532,11 @@ class LiveInspectionPage(QWidget):
     def _update_buttons(self) -> None:
         has_session = self._session is not None
         can_capture = self._camera_active() or self._is_sim_mode
-        self.btn_import.setEnabled(has_session)
-        self.btn_capture.setEnabled(has_session and can_capture)
+        import_error = self._model_assignment_error(demo=False)
+        capture_error = self._model_assignment_error(demo=self._is_sim_mode)
+        self._set_operational_model_warning(self._operational_warning_text())
+        self.btn_import.setEnabled(has_session and import_error is None)
+        self.btn_capture.setEnabled(has_session and can_capture and capture_error is None)
         self.btn_deep.setEnabled(
             has_session and self._detection is not None and not self._is_analyzing
         )
@@ -989,6 +1549,7 @@ class LiveInspectionPage(QWidget):
         mode = self.feed_mode_combo.itemData(index)
         self._is_sim_mode = (mode == "simulation")
         self.sim_controls_widget.setVisible(self._is_sim_mode)
+        self._sync_realtime_classes()
         if self._session is not None and self.isVisible():
             self._start_camera()
         elif self._is_sim_mode:
@@ -1025,6 +1586,7 @@ class LiveInspectionPage(QWidget):
             buffer.setData(data)
             buffer.open(QIODevice.OpenModeFlag.ReadOnly)
             reader = QImageReader(buffer)
+            reader.setAutoTransform(True)
             fmt = bytes(reader.format()).decode("ascii").lower()
             image = reader.read()
             if fmt not in {"png", "jpeg", "jpg", "bmp", "webp"} or image.isNull():
@@ -1051,6 +1613,9 @@ class LiveInspectionPage(QWidget):
         self._update_sim_frame()
 
     def _update_sim_frame(self) -> None:
+        self._frame_token += 1
+        self._sim_frame_token = self._frame_token
+
         scenario = self.sim_sample_combo.currentData() or "fresh"
         if scenario == "custom":
             if self._custom_sim_image is None:
@@ -1061,25 +1626,9 @@ class LiveInspectionPage(QWidget):
         else:
             raw_img = self._render_raw_sim_image(scenario)
         self._current_raw_sim_image = raw_img
-
-        if self._yolo_engine.is_loaded:
-            yolo_out = self._yolo_engine.infer(raw_img, track=True)
-            self._current_sim_image = draw_detections_on_qimage(
-                raw_img,
-                yolo_out.boxes,
-                fps_text=f"ONNX · {yolo_out.inference_ms:.1f} ms",
-            )
-            self._apply_realtime_counts(yolo_out.detection.class_counts)
-        else:
-            self._current_sim_image = raw_img
-
-        pixmap = QPixmap.fromImage(self._current_sim_image)
-        scaled = pixmap.scaled(
-            self.sim_frame_label.size(),
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        )
-        self.sim_frame_label.setPixmap(scaled)
+        self._show_sim_image(raw_img)
+        self._sync_realtime_classes()
+        self._submit_preview(raw_img, simulation=True)
 
     def _render_raw_sim_image(self, scenario: str) -> QImage:
         """Render an unannotated synthetic fruit crate image BEFORE bounding boxes (T1.6)."""
@@ -1147,7 +1696,7 @@ class LiveInspectionPage(QWidget):
     def _render_sim_image(self, scenario: str) -> QImage:
         """Backward-compatible helper returning the annotated simulation frame."""
         raw = self._render_raw_sim_image(scenario)
-        if self._yolo_engine.is_loaded:
+        if self._yolo_engine.is_loaded and not self._model_assignment_error(demo=True):
             out = self._yolo_engine.infer(raw, track=True)
             return draw_detections_on_qimage(raw, out.boxes)
         return raw
@@ -1161,3 +1710,7 @@ class LiveInspectionPage(QWidget):
     def hideEvent(self, event) -> None:  # noqa: N802 — Qt override
         self._stop_camera()   # Giải phóng camera khi rời trang
         super().hideEvent(event)
+
+    def closeEvent(self, event) -> None:  # noqa: N802 — Qt override
+        self._stop_camera()
+        super().closeEvent(event)

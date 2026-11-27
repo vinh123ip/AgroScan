@@ -15,16 +15,20 @@ Key capabilities:
 
 from __future__ import annotations
 
+import atexit
 from dataclasses import dataclass, field
+import logging
 import math
 from pathlib import Path
+import threading
 import time
 from typing import Optional, Sequence, Union
+import weakref
 
 import cv2
 import numpy as np
 import onnxruntime as ort
-from PySide6.QtCore import QMutex, QMutexLocker, QObject, QThread, Qt, Signal
+from PySide6.QtCore import QMutex, QMutexLocker, QObject, QThread, QWaitCondition, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPen
 
 from agroscan.models.inspection_models import DetectionResult, Product
@@ -33,6 +37,7 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_WEIGHTS_DIR = REPO_ROOT / "models" / "weights"
 FALLBACK_WEIGHTS_DIR = REPO_ROOT / "models_ai"
 DEFAULT_CLASSES: tuple[str, ...] = ("fresh", "bruised", "rotten")
+_SPECIES_ONLY_LABELS = frozenset({"apple", "orange", "banana", "shrimp", "squid", "fruit", "object"})
 
 
 @dataclass
@@ -83,8 +88,8 @@ def resolve_model_path(
     """Locate an `.onnx` model file across standard AgroScan model directories."""
     cleaned = (model_file or "fruit_defect.onnx").strip()
     direct = Path(cleaned)
-    if direct.is_absolute() and direct.is_file():
-        return direct
+    if direct.is_absolute():
+        return direct if direct.is_file() else None
 
     dirs: list[Path] = []
     if search_dirs:
@@ -95,8 +100,8 @@ def resolve_model_path(
     if Path(cleaned).name != "fruit_defect.onnx":
         candidates.append("fruit_defect.onnx")
 
-    for base in dirs:
-        for candidate in candidates:
+    for candidate in candidates:
+        for base in dirs:
             path = base / candidate
             if path.is_file():
                 return path
@@ -229,13 +234,19 @@ class YoloEngine:
         class_names: Sequence[str] = DEFAULT_CLASSES,
         conf_threshold: float = 0.45,
         iou_threshold: float = 0.40,
+        max_det: int = 1000,
+        letterbox_fill: tuple[int, int, int] = (18, 22, 28),
     ) -> None:
         self._class_names = list(class_names) if class_names else list(DEFAULT_CLASSES)
-        self._conf_threshold = conf_threshold
-        self._iou_threshold = iou_threshold
+        self._conf_threshold = float(conf_threshold)
+        self._iou_threshold = float(iou_threshold)
+        self._max_det = max(1, int(max_det))
+        self._input_size: tuple[int, int] = self.INPUT_SIZE
+        self._letterbox_fill: tuple[int, int, int] = tuple(int(c) for c in letterbox_fill)
         self._session: Optional[ort.InferenceSession] = None
         self._input_name: str = "images"
         self._model_path: Optional[Path] = None
+        self._model_class_count: Optional[int] = None
         self._tracker = CentroidTracker()
         self._lock = QMutex()
 
@@ -254,6 +265,19 @@ class YoloEngine:
     def class_names(self) -> list[str]:
         return list(self._class_names)
 
+    @property
+    def input_size(self) -> tuple[int, int]:
+        return self._input_size
+
+    def unload(self) -> None:
+        """Unload any active ONNX session safely."""
+        with QMutexLocker(self._lock):
+            self._session = None
+            self._model_path = None
+            self._model_class_count = None
+            self._input_size = self.INPUT_SIZE
+            self._tracker.reset()
+
     def reset_tracker(self) -> None:
         with QMutexLocker(self._lock):
             self._tracker.reset()
@@ -262,30 +286,91 @@ class YoloEngine:
         self,
         model_file_or_path: Union[Path, str],
         class_names: Optional[Sequence[str]] = None,
+        *,
+        conf_threshold: Optional[float] = None,
+        iou_threshold: Optional[float] = None,
+        max_det: Optional[int] = None,
+        letterbox_fill: Optional[tuple[int, int, int]] = None,
     ) -> bool:
-        """Load an `.onnx` model into `onnxruntime.InferenceSession`."""
+        """Load an `.onnx` model atomically into `onnxruntime.InferenceSession`."""
         with QMutexLocker(self._lock):
-            if class_names:
-                self._class_names = [str(c) for c in class_names]
             resolved = resolve_model_path(str(model_file_or_path))
             if resolved is None or not resolved.is_file():
-                self._session = None
-                self._model_path = None
                 return False
+
+            next_classes = (
+                [str(c).strip() for c in class_names]
+                if class_names is not None
+                else list(self._class_names)
+            )
+            if not next_classes or any(not c for c in next_classes):
+                return False
+            if len(set(next_classes)) != len(next_classes):
+                return False
+            next_conf = self._conf_threshold if conf_threshold is None else float(conf_threshold)
+            next_iou = self._iou_threshold if iou_threshold is None else float(iou_threshold)
+            next_max_det = self._max_det if max_det is None else max(1, int(max_det))
+            next_fill = (
+                self._letterbox_fill
+                if letterbox_fill is None
+                else (int(letterbox_fill[0]), int(letterbox_fill[1]), int(letterbox_fill[2]))
+            )
 
             sess_options = ort.SessionOptions()
             sess_options.intra_op_num_threads = 2
             sess_options.graph_optimization_level = (
                 ort.GraphOptimizationLevel.ORT_ENABLE_ALL
             )
-            self._session = ort.InferenceSession(
-                str(resolved),
-                sess_options=sess_options,
-                providers=["CPUExecutionProvider"],
-            )
-            inputs = self._session.get_inputs()
-            self._input_name = inputs[0].name if inputs else "images"
+            try:
+                session = ort.InferenceSession(
+                    str(resolved),
+                    sess_options=sess_options,
+                    providers=["CPUExecutionProvider"],
+                )
+                inputs = session.get_inputs()
+                outputs = session.get_outputs()
+                if not inputs or not outputs:
+                    return False
+
+                output_shape = outputs[0].shape
+                if (
+                    output_shape is None
+                    or len(output_shape) != 3
+                    or (output_shape[0] not in (1, None) and not isinstance(output_shape[0], str))
+                    or not isinstance(output_shape[1], int)
+                    or output_shape[1] <= 4
+                ):
+                    return False
+
+                model_class_count = output_shape[1] - 4
+                if model_class_count != len(next_classes):
+                    return False
+
+                input_name = inputs[0].name
+                inferred_size = self.INPUT_SIZE
+                input_shape = inputs[0].shape
+                if (
+                    input_shape is not None
+                    and len(input_shape) == 4
+                    and isinstance(input_shape[2], int)
+                    and isinstance(input_shape[3], int)
+                    and input_shape[2] > 0
+                    and input_shape[3] > 0
+                ):
+                    inferred_size = (int(input_shape[3]), int(input_shape[2]))
+            except Exception:
+                return False
+
+            self._session = session
+            self._input_name = input_name
+            self._input_size = inferred_size
             self._model_path = resolved
+            self._model_class_count = model_class_count
+            self._class_names = next_classes
+            self._conf_threshold = next_conf
+            self._iou_threshold = next_iou
+            self._max_det = next_max_det
+            self._letterbox_fill = next_fill
             self._tracker.reset()
             return True
 
@@ -296,15 +381,15 @@ class YoloEngine:
     def preprocess(
         self, rgb_image: np.ndarray
     ) -> tuple[np.ndarray, float, int, int]:
-        """Letterbox resize `(H, W, 3)` RGB uint8 array to `(1, 3, 640, 640)` float32."""
+        """Letterbox resize `(H, W, 3)` RGB uint8 array to `(1, 3, H_in, W_in)` float32."""
         orig_h, orig_w = rgb_image.shape[:2]
-        target_w, target_h = self.INPUT_SIZE
+        target_w, target_h = self._input_size
         scale = min(target_w / max(1, orig_w), target_h / max(1, orig_h))
-        new_w = int(round(orig_w * scale))
-        new_h = int(round(orig_h * scale))
+        new_w = max(1, int(round(orig_w * scale)))
+        new_h = max(1, int(round(orig_h * scale)))
 
         resized = cv2.resize(rgb_image, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-        canvas = np.full((target_h, target_w, 3), (18, 22, 28), dtype=np.uint8)
+        canvas = np.full((target_h, target_w, 3), self._letterbox_fill, dtype=np.uint8)
         pad_x = (target_w - new_w) // 2
         pad_y = (target_h - new_h) // 2
         canvas[pad_y : pad_y + new_h, pad_x : pad_x + new_w] = resized
@@ -324,14 +409,35 @@ class YoloEngine:
         track: bool = True,
     ) -> tuple[list[BoundingBox], DetectionResult]:
         """Decode YOLOv8 `(1, 4+C, N)` predictions into `BoundingBox` list and `DetectionResult`."""
-        preds = raw_output[0] if raw_output.ndim == 3 else raw_output
-        # YOLOv8 shape is (4 + num_classes, num_anchors) -> transpose to (num_anchors, 4 + num_classes)
-        if preds.shape[0] < preds.shape[1]:
-            preds = preds.T
+        if self._model_class_count is None:
+            raise RuntimeError("YOLO output class count has not been verified.")
+        arr = np.asarray(raw_output)
+        if (
+            arr.ndim != 3
+            or arr.shape[0] != 1
+            or arr.shape[1] != 4 + self._model_class_count
+        ):
+            raise ValueError(f"Unexpected YOLO output shape: {arr.shape!r}")
+        if len(self._class_names) != self._model_class_count:
+            raise RuntimeError("YOLO class configuration no longer matches the model.")
+        if orig_w <= 0 or orig_h <= 0 or not math.isfinite(scale) or scale <= 0:
+            raise ValueError("Invalid original image dimensions or letterbox scale.")
 
-        if preds.shape[1] < 5:
+        has_defect_classes = (
+            self._model_class_count == len(self._class_names)
+            and self._model_class_count > 1
+            and not all(c.strip().lower() in _SPECIES_ONLY_LABELS for c in self._class_names)
+        )
+        preds = arr[0].T
+        if preds.shape[0] == 0:
             empty_counts = {cls: 0 for cls in self._class_names}
-            return [], DetectionResult(0, empty_counts, 0.0, is_simulated=False)
+            return [], DetectionResult(
+                0,
+                empty_counts,
+                0.0,
+                is_simulated=False,
+                defect_classification_available=has_defect_classes,
+            )
 
         boxes_xywh = preds[:, :4]
         class_scores = preds[:, 4:]
@@ -344,17 +450,21 @@ class YoloEngine:
         max_scores = max_scores[mask]
 
         candidates: list[BoundingBox] = []
-        inv_scale = 1.0 / max(scale, 1e-6)
+        inv_scale = 1.0 / scale
         for (cx, cy, bw, bh), cls_id, score in zip(boxes_xywh, class_ids, max_scores):
+            if not np.isfinite([cx, cy, bw, bh, score]).all() or bw <= 0 or bh <= 0:
+                continue
             x1 = int(round((cx - bw * 0.5 - pad_x) * inv_scale))
             y1 = int(round((cy - bh * 0.5 - pad_y) * inv_scale))
             x2 = int(round((cx + bw * 0.5 - pad_x) * inv_scale))
             y2 = int(round((cy + bh * 0.5 - pad_y) * inv_scale))
 
-            x1 = max(0, min(orig_w - 1, x1))
-            y1 = max(0, min(orig_h - 1, y1))
-            x2 = max(x1 + 1, min(orig_w, x2))
-            y2 = max(y1 + 1, min(orig_h, y2))
+            x1 = max(0, min(orig_w, x1))
+            y1 = max(0, min(orig_h, y1))
+            x2 = max(0, min(orig_w, x2))
+            y2 = max(0, min(orig_h, y2))
+            if x2 <= x1 or y2 <= y1:
+                continue
 
             cls_idx = int(cls_id)
             label = (
@@ -375,6 +485,8 @@ class YoloEngine:
             )
 
         kept = non_max_suppression(candidates, iou_threshold=self._iou_threshold)
+        if self._max_det > 0 and len(kept) > self._max_det:
+            kept = kept[: self._max_det]
         # Sort top-to-bottom, left-to-right for stable track ordering
         kept.sort(key=lambda b: (b.y1 // 40, b.x1))
         if track:
@@ -393,6 +505,7 @@ class YoloEngine:
             class_counts=counts,
             mean_confidence=mean_conf,
             is_simulated=False,
+            defect_classification_available=has_defect_classes,
         )
         return kept, detection
 
@@ -431,6 +544,27 @@ class YoloEngine:
             )
 
 
+_LOG = logging.getLogger(__name__)
+_ACTIVE_WORKERS_LOCK = threading.Lock()
+_ACTIVE_WORKERS: weakref.WeakSet["YoloInferenceThread"] = weakref.WeakSet()
+
+
+def _shutdown_active_yolo_workers() -> None:
+    with _ACTIVE_WORKERS_LOCK:
+        workers = list(_ACTIVE_WORKERS)
+    for worker in workers:
+        try:
+            joined = worker.stop_worker(wait_ms=10000, permanent=True)
+            if not joined:
+                _LOG.warning("YoloInferenceThread did not stop within 10s during exit cleanup")
+                worker.setParent(None)
+        except RuntimeError:
+            pass
+
+
+atexit.register(_shutdown_active_yolo_workers)
+
+
 class YoloInferenceThread(QThread):
     """Background ``QThread`` executing ``YoloEngine.infer`` without blocking the UI (T1.4)."""
 
@@ -443,10 +577,15 @@ class YoloInferenceThread(QThread):
         super().__init__(parent)
         self._engine = engine
         self._mutex = QMutex()
+        self._work_available = QWaitCondition()
         self._pending_frame: Optional[QImage] = None
         self._pending_track: bool = True
         self._pending_request_id: int = 0
         self._stop_requested: bool = False
+        self._permanent_stop: bool = False
+        self._started: bool = False
+        with _ACTIVE_WORKERS_LOCK:
+            _ACTIVE_WORKERS.add(self)
 
     def submit_frame(
         self, frame: QImage, track: bool = True, request_id: int = 0
@@ -454,36 +593,80 @@ class YoloInferenceThread(QThread):
         """Queue the latest frame for background inference (drops stale intermediate frames)."""
         if frame.isNull():
             return
+        need_start = False
         with QMutexLocker(self._mutex):
+            if self._stop_requested or self._permanent_stop:
+                return
             self._pending_frame = frame.copy()
             self._pending_track = track
             self._pending_request_id = request_id
-            self._stop_requested = False
-        if not self.isRunning():
-            self.start()
+            if not self._started:
+                self._started = True
+                need_start = True
+            else:
+                self._work_available.wakeOne()
+        if need_start:
+            if self.isRunning() and QThread.currentThread() != self:
+                self.wait(5000)
+            with QMutexLocker(self._mutex):
+                if self._stop_requested or self._permanent_stop:
+                    self._started = False
+                    if not self._permanent_stop:
+                        self._stop_requested = False
+                    return
+                if self.isRunning():
+                    self._started = False
+                    _LOG.warning("Timed out waiting for prior YoloInferenceThread run to exit")
+                    return
+                self.start()
 
-    def stop_worker(self, wait_ms: int = 1000) -> None:
+    def stop_worker(self, wait_ms: int = 1000, *, permanent: bool = False) -> bool:
+        """Stop the worker thread cleanly; set ``permanent=True`` on final teardown."""
+        if wait_ms < 0:
+            raise ValueError("wait_ms must be non-negative")
         with QMutexLocker(self._mutex):
             self._pending_frame = None
+            if permanent:
+                self._permanent_stop = True
+            if not self._started:
+                self._stop_requested = permanent
+                return True
             self._stop_requested = True
-        if self.isRunning():
-            self.wait(wait_ms)
+            self._work_available.wakeAll()
+        if QThread.currentThread() == self:
+            return False
+        return self.wait(wait_ms)
 
     def run(self) -> None:
-        while True:
-            with QMutexLocker(self._mutex):
-                if self._stop_requested or self._pending_frame is None:
-                    return
-                frame = self._pending_frame
-                track = self._pending_track
-                req_id = self._pending_request_id
-                self._pending_frame = None
+        try:
+            while True:
+                with QMutexLocker(self._mutex):
+                    while not self._stop_requested and self._pending_frame is None:
+                        self._work_available.wait(self._mutex)
+                    if self._stop_requested:
+                        return
+                    frame = self._pending_frame
+                    track = self._pending_track
+                    req_id = self._pending_request_id
+                    self._pending_frame = None
 
-            try:
-                result = self._engine.infer(frame, track=track, request_id=req_id)
-                self.inference_ready.emit(result)
-            except Exception as exc:  # pragma: no cover - defensive worker guard
-                self.inference_error.emit(str(exc))
+                try:
+                    result = self._engine.infer(frame, track=track, request_id=req_id)
+                except Exception as exc:  # pragma: no cover - defensive worker guard
+                    with QMutexLocker(self._mutex):
+                        stopped = self._stop_requested
+                    if not stopped:
+                        self.inference_error.emit(str(exc))
+                else:
+                    with QMutexLocker(self._mutex):
+                        stopped = self._stop_requested
+                    if not stopped:
+                        self.inference_ready.emit(result)
+        finally:
+            with QMutexLocker(self._mutex):
+                self._started = False
+                if not self._permanent_stop:
+                    self._stop_requested = False
 
 
 def draw_detections_on_qimage(
@@ -496,10 +679,16 @@ def draw_detections_on_qimage(
     The input ``raw_image`` is never mutated so raw evidence SHA-256 remains intact.
     """
     annotated = raw_image.copy()
+    if annotated.isNull():
+        return annotated
+
     painter = QPainter(annotated)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    img_w = annotated.width()
+    img_h = annotated.height()
+    dense_mode = len(boxes) > 30
 
-    for box in boxes:
+    for idx, box in enumerate(boxes, start=1):
         lower_label = box.label.lower()
         if "rotten" in lower_label:
             color = QColor(239, 68, 68)
@@ -507,31 +696,55 @@ def draw_detections_on_qimage(
         elif "bruised" in lower_label:
             color = QColor(245, 158, 11)
             fill = QColor(245, 158, 11, 38)
+        elif lower_label == "apple":
+            color = QColor(59, 130, 246)
+            fill = QColor(59, 130, 246, 24)
         else:
             color = QColor(16, 185, 129)
             fill = QColor(16, 185, 129, 38)
 
-        painter.setPen(QPen(color, 2))
+        painter.setPen(QPen(color, 1 if dense_mode else 2))
         painter.setBrush(fill)
-        painter.drawRoundedRect(box.x1, box.y1, box.width, box.height, 5, 5)
+        painter.drawRoundedRect(box.x1, box.y1, box.width, box.height, 4, 4)
 
-        track_prefix = f"#{box.track_id} " if box.track_id is not None else ""
-        caption = f" {track_prefix}{box.label} {box.confidence:.2f} "
-        badge_w = min(max(78, len(caption) * 6 + 6), 140)
-        badge_y = max(2, box.y1 - 18)
+        if dense_mode:
+            tag = f"{idx}"
+            tag_w = min(26, max(16, len(tag) * 7 + 6))
+            tag_x = max(0, min(img_w - tag_w, box.x1))
+            tag_y = max(0, min(img_h - 14, box.y1))
+            painter.setBrush(color)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawRect(tag_x, tag_y, tag_w, 13)
+            painter.setPen(QColor(255, 255, 255))
+            painter.setFont(QFont("Inter", 6, QFont.Weight.Bold))
+            painter.drawText(tag_x + 2, tag_y + 10, tag)
+        else:
+            track_prefix = f"#{box.track_id} " if box.track_id is not None else ""
+            caption = f" {track_prefix}{box.label} {box.confidence:.2f} "
+            badge_w = min(max(78, len(caption) * 6 + 6), min(160, max(24, img_w)))
+            badge_x = max(0, min(img_w - badge_w, box.x1))
+            badge_y = max(2, min(max(2, img_h - 17), box.y1 - 18))
 
-        painter.setBrush(color)
+            painter.setBrush(color)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawRoundedRect(badge_x, badge_y, badge_w, 17, 3, 3)
+
+            painter.setPen(QColor(255, 255, 255))
+            painter.setFont(QFont("Inter", 7, QFont.Weight.Bold))
+            painter.drawText(badge_x + 3, badge_y + 12, caption)
+
+    if fps_text and img_w >= 48 and img_h >= 28:
+        font = QFont("Inter", 8 if img_w < 480 else 9, QFont.Weight.Medium)
+        painter.setFont(font)
+        text_w = min(img_w - 16, painter.fontMetrics().horizontalAdvance(fps_text) + 12)
+        text_h = 20
+        pos_x = max(8, img_w - text_w - 8)
+        pos_y = 8
+        painter.setBrush(QColor(15, 23, 42, 185))
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.drawRoundedRect(box.x1, badge_y, badge_w, 17, 3, 3)
-
-        painter.setPen(QColor(255, 255, 255))
-        painter.setFont(QFont("Inter", 7, QFont.Weight.Bold))
-        painter.drawText(box.x1 + 3, badge_y + 12, caption)
-
-    if fps_text:
-        painter.setPen(QColor(148, 163, 184))
-        painter.setFont(QFont("Inter", 9, QFont.Weight.Medium))
-        painter.drawText(550, 75, fps_text)
+        painter.drawRoundedRect(pos_x, pos_y, text_w, text_h, 4, 4)
+        painter.setPen(QColor(226, 232, 240))
+        painter.drawText(pos_x + 6, pos_y + 14, fps_text)
 
     painter.end()
     return annotated

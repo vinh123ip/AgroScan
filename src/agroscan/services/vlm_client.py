@@ -35,6 +35,26 @@ from agroscan.services.app_settings import AppSettings, ConnectionSettings
 from agroscan.services.evidence_service import encode_qimage_bytes
 
 
+def _extract_json_block(text: str) -> Optional[dict[str, Any]]:
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        lines = cleaned.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        cleaned = "\n".join(lines).strip()
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None
+    try:
+        parsed = json.loads(cleaned[start : end + 1])
+        return parsed if isinstance(parsed, dict) else None
+    except json.JSONDecodeError:
+        return None
+
+
 def _encode_image_base64(image: Optional[Union[QImage, bytes, bytearray]]) -> str:
     if image is None:
         return ""
@@ -180,7 +200,12 @@ def request_deep_analysis(
     try:
         if is_openai_chat:
             try:
-                findings = json.loads(decoded["choices"][0]["message"]["content"])
+                content = decoded["choices"][0]["message"]["content"]
+                if not isinstance(content, str):
+                    raise TypeError("Model content must be a JSON string.")
+                findings = _extract_json_block(content)
+                if findings is None:
+                    raise ValueError("No valid JSON object in model reply.")
             except (KeyError, IndexError, TypeError, ValueError):
                 raise VlmSchemaError("Missing or invalid model JSON.") from None
             analysis = model_analysis(findings, req_id, str(decoded.get("model") or "Qwen-VL"),
@@ -260,7 +285,7 @@ class VlmAnalysisThread(QThread):
             image=self._image,
             settings=self._settings,
             scenario=self._scenario,
-            timeout_s=min(1.5, self._settings.ai_timeout_s) if self._fallback_to_mock else self._settings.ai_timeout_s,
+            timeout_s=min(5.0, self._settings.ai_timeout_s) if self._fallback_to_mock else self._settings.ai_timeout_s,
             fallback_to_mock=self._fallback_to_mock,
         )
         self.analysis_completed.emit(self._token, result)

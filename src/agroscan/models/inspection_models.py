@@ -270,6 +270,7 @@ class DetectionResult:
     class_counts:    dict[str, int]   # Ví dụ: {"fresh": 21, "bruised": 3}
     mean_confidence: float            # 0.0 – 1.0
     is_simulated:    bool = True
+    defect_classification_available: bool = True
 
     def ratio(self, defect_class: str) -> float:
         """Tỷ lệ của một lớp trên tổng số quả phát hiện được."""

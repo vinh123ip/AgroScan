@@ -1,0 +1,76 @@
+{
+  "schema": "agroscan.khang-ai-onnx-bundle/1",
+  "product": "apple",
+  "detectors": {
+    "open_box": {
+      "model_file": "apple_detector_open_box.onnx",
+      "sha256": "df94361856f9c5514d415c0b6bfb1e2d16139c912897ed6b6756556670f90353",
+      "source_weights_sha256": "2d6656d5714e61e2a5e573eb9cad4a6cebab969fb980c305892e83c3519743a2",
+      "image_size": 1280,
+      "confidence": 0.25,
+      "nms_iou": 0.55,
+      "max_det": 1000,
+      "classes": [
+        "apple"
+      ],
+      "letterbox_fill": [
+        114,
+        114,
+        114
+      ]
+    },
+    "tray": {
+      "model_file": "apple_detector_tray.onnx",
+      "sha256": "e3a2ba9e2bd104b5eac35a7deadd3b03dca61e250ea21f3335a21182470709e4",
+      "source_weights_sha256": "f82eeb05a921845512a2d476ecba2fa42cebf4db3c0f1d26d249b6e11dfe27eb",
+      "image_size": 960,
+      "confidence": 0.25,
+      "nms_iou": 0.6,
+      "max_det": 1000,
+      "classes": [
+        "apple"
+      ],
+      "letterbox_fill": [
+        114,
+        114,
+        114
+      ]
+    }
+  },
+  "classifier": {
+    "model_file": "apple_vs_other_resnet18.onnx",
+    "sha256": "47e3fead9328d5daacfc67804f1273e87cc25b18d646c2630f30a5dfe622836a",
+    "source_weights_sha256": "f4a6209475b05583e8e9ae797fbe06704da85629eece7a2082e8ba8109c10590",
+    "labels": [
+      "apple",
+      "other"
+    ],
+    "other_label": "other",
+    "image_size": 224,
+    "letterbox_fill": [
+      114,
+      114,
+      114
+    ],
+    "mean": [
+      0.485,
+      0.456,
+      0.406
+    ],
+    "std": [
+      0.229,
+      0.224,
+      0.225
+    ],
+    "temperature": 0.5,
+    "min_confidence": 0.85,
+    "development_only": true,
+    "can_make_final_decision": false
+  },
+  "vlm": {
+    "default_backend": "lm_studio",
+    "optional_local_backend": "llama_br14",
+    "prompt_version": "br14-v2",
+    "model_version": "Qwen3-VL-4B-Instruct-Q4_K_M"
+  }
+}

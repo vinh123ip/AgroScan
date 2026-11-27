@@ -62,6 +62,10 @@ def _exceeds_limit(criterion: DefectCriterion, ratio: float) -> bool:
 
 def _uncertainty_reasons(product: Product, detection: DetectionResult) -> list[str]:
     reasons: list[str] = []
+    if product.criteria and not detection.defect_classification_available:
+        reasons.append(
+            "Count-only detector output: surface defect screening requires VLM deep analysis or human review."
+        )
     if detection.total_objects < product.min_objects:
         reasons.append(
             f"Only {detection.total_objects} objects detected "
