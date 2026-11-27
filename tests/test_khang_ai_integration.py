@@ -78,7 +78,14 @@ from server.qwen_service import (
 )
 
 WORKSPACE_VAL_DIR = Path(__file__).resolve().parents[3] / "data" / "development" / "apple-box-v2" / "val" / "images"
-_KHANG_BUNDLE_READY = KhangAiAdapter().is_available()
+WORKSPACE_ORANGE_TEST_DIR = Path(__file__).resolve().parents[3] / "data" / "development" / "orange-open-box-v3e" / "test" / "images"
+WORKSPACE_BANANA_TEST_DIR = Path(__file__).resolve().parents[3] / "data" / "development" / "banana-open-box-v1" / "test" / "images"
+WORKSPACE_CLF_TEST_DIR = Path(__file__).resolve().parents[3] / "data" / "development" / "classifier-4class-v1" / "test"
+_KHANG_BUNDLE_READY = (
+    KhangAiAdapter().is_available("apple")
+    and KhangAiAdapter().is_available("orange")
+    and KhangAiAdapter().is_available("banana")
+)
 
 _APP: QApplication | None = None
 
@@ -127,9 +134,12 @@ class TestKhangOnnxAndBugFixes(unittest.TestCase):
     @unittest.skipUnless(_KHANG_BUNDLE_READY, "Optional Khang ONNX bundle not installed")
     def test_load_khang_manifest_and_presets_with_dynamic_sizes(self) -> None:
         manifest, base_dir = load_khang_manifest()
-        self.assertEqual(manifest["product"], "apple")
-        self.assertIn("open_box", manifest["detectors"])
-        self.assertIn("tray", manifest["detectors"])
+        self.assertEqual(manifest["schema"], MANIFEST_SCHEMA_V2)
+        for product_code in ("apple", "orange", "banana"):
+            self.assertIn(product_code, manifest["products"])
+            self.assertIn("open_box", manifest["products"][product_code]["detectors"])
+        self.assertIn("tray", manifest["products"]["apple"]["detectors"])
+        self.assertEqual(manifest["classifier"]["labels"], ["apple", "orange", "banana", "other"])
 
         engine = YoloEngine()
         meta_open = load_apple_detector_preset(engine, "open_box")
@@ -141,15 +151,28 @@ class TestKhangOnnxAndBugFixes(unittest.TestCase):
         self.assertEqual(engine.input_size, (960, 960))
         self.assertEqual(meta_tray["image_size"], 960)
 
+        meta_orange = load_product_detector_preset(engine, "orange", "open_box")
+        self.assertEqual(engine.input_size, (1280, 1280))
+        self.assertEqual(engine.class_names, ["orange"])
+        self.assertEqual(meta_orange["product"], "orange")
+        self.assertTrue((base_dir / meta_orange["model_file"]).is_file())
+
+        meta_banana = load_product_detector_preset(engine, "banana", "open_box")
+        self.assertEqual(engine.input_size, (1280, 1280))
+        self.assertEqual(engine.class_names, ["banana"])
+        self.assertEqual(meta_banana["product"], "banana")
+        self.assertTrue((base_dir / meta_banana["model_file"]).is_file())
+
     @unittest.skipUnless(_KHANG_BUNDLE_READY, "Optional Khang ONNX bundle not installed")
     def test_tampered_manifest_sha256_is_rejected(self) -> None:
         manifest, base_dir = load_khang_manifest()
         tampered = json.loads(json.dumps(manifest))
-        tampered["detectors"]["open_box"]["sha256"] = "0" * 64
+        open_box_entry = tampered["products"]["apple"]["detectors"]["open_box"]
+        open_box_entry["sha256"] = "0" * 64
         with tempfile.TemporaryDirectory() as tmp:
             fake_onnx = Path(tmp) / "fake.onnx"
             fake_onnx.write_bytes(b"not-a-real-onnx")
-            tampered["detectors"]["open_box"]["model_file"] = "fake.onnx"
+            open_box_entry["model_file"] = "fake.onnx"
             tampered_manifest = Path(tmp) / "manifest.json"
             tampered_manifest.write_text(json.dumps(tampered), encoding="utf-8")
             with self.assertRaises(ValueError):
@@ -376,6 +399,27 @@ class TestKhangOnnxAndBugFixes(unittest.TestCase):
             self.assertEqual(adapter.available_presets(), [])
             self.assertFalse(adapter.is_preset_available("apple", "open_box"))
             self.assertFalse(adapter.is_classifier_available())
+
+            manifest_path_v2 = Path(tmp) / "khang_ai_manifest_v2.json"
+            manifest_path_v2.write_text(
+                json.dumps({
+                    "schema": MANIFEST_SCHEMA_V2,
+                    "default_product": "apple",
+                    "products": {
+                        "orange": {"detectors": {"open_box": {"model_file": "missing_orange.onnx", "sha256": "c" * 64, "classes": ["orange"]}}},
+                        "banana": {"detectors": {"open_box": {"model_file": "missing_banana.onnx", "sha256": "d" * 64, "classes": ["banana"]}}},
+                    },
+                    "classifier": {"model_file": "missing_resnet4.onnx", "sha256": "e" * 64, "labels": ["apple", "orange", "banana", "other"]},
+                }),
+                encoding="utf-8",
+            )
+            adapter_v2 = KhangAiAdapter(manifest_path=manifest_path_v2)
+            self.assertFalse(adapter_v2.is_available("orange"))
+            self.assertFalse(adapter_v2.is_available("banana"))
+            self.assertEqual(adapter_v2.available_presets("orange"), [])
+            self.assertEqual(adapter_v2.available_presets("banana"), [])
+            self.assertFalse(adapter_v2.is_preset_available("orange", "open_box"))
+            self.assertFalse(adapter_v2.is_classifier_available())
 
     def test_khang_adapter_v2_manifest_multiproduct_and_unsupported_guard(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -779,19 +823,28 @@ class TestKhangRealAppleAndLiveInspection(unittest.TestCase):
         khang_eng = self._make_stub_engine()
         adapter = Mock()
         adapter.is_available.return_value = True
-        adapter.load_detector_preset.side_effect = lambda eng, preset: (
+        adapter.available_presets.side_effect = (
+            lambda p="apple": ["open_box", "tray"] if str(p).lower() == "apple" else []
+        )
+        adapter.is_preset_available.side_effect = (
+            lambda p="apple", preset="open_box": str(p).lower() == "apple" and preset in ("open_box", "tray")
+        )
+        adapter.load_detector_preset.side_effect = lambda eng, preset, product_code="apple": (
             setattr(eng, "is_loaded", True),
-            setattr(eng, "model_path", Path(f"apple_detector_{preset}.onnx")),
-            {"model_file": f"apple_detector_{preset}.onnx", "image_size": 1280 if preset == "open_box" else 960},
+            setattr(eng, "model_path", Path(f"{product_code}_detector_{preset}.onnx")),
+            setattr(eng, "class_names", [str(product_code).lower()]),
+            {"model_file": f"{product_code}_detector_{preset}.onnx", "image_size": 1280 if preset == "open_box" else 960},
         )[-1]
-        adapter.check_apple_container.return_value = ContainerCheckResult(
+        precheck_ok = ContainerCheckResult(
             predicted_label="apple",
             confidence=0.95,
-            probabilities={"apple": 0.95, "other": 0.05},
+            probabilities={"apple": 0.95, "orange": 0.01, "banana": 0.01, "other": 0.03},
             status="MATCH",
             reason="",
-            model_file="apple_vs_other_resnet18.onnx",
+            model_file="container_4class_resnet18.onnx",
         )
+        adapter.check_apple_container.return_value = precheck_ok
+        adapter.check_container.return_value = precheck_ok
 
         with (
             patch("agroscan.ui.pages.live_inspection_page.YoloEngine", side_effect=[base_eng, khang_eng]),
@@ -873,6 +926,226 @@ class TestKhangRealAppleAndLiveInspection(unittest.TestCase):
         self.assertEqual(page.apple_preset_combo.currentData(), "tray")
         self.assertTrue(page._use_khang_apple_detector())
         self.assertEqual(list(page._realtime_labels.keys()), ["apple"])
+
+    @unittest.skipUnless(
+        _KHANG_BUNDLE_READY and WORKSPACE_ORANGE_TEST_DIR.is_dir() and WORKSPACE_BANANA_TEST_DIR.is_dir(),
+        "Optional Khang V2 bundle or orange/banana test images not present",
+    )
+    def test_real_orange_and_banana_v2_bundle_inference_and_needs_review(self) -> None:
+        orange_imgs = sorted(WORKSPACE_ORANGE_TEST_DIR.glob("lvis_*.jpg"))
+        banana_imgs = sorted(WORKSPACE_BANANA_TEST_DIR.glob("lvis_*.jpg"))
+        self.assertTrue(orange_imgs, "Expected at least one orange container test image")
+        self.assertTrue(banana_imgs, "Expected at least one banana container test image")
+
+        page = LiveInspectionPage(self.settings)
+        self.addCleanup(page.deleteLater)
+        self.addCleanup(page.clear_session)
+
+        cases = [
+            ("ORANGE", "Orange", "orange_defect.onnx", 48, orange_imgs[0], "orange_detector_open_box.onnx", "orange"),
+            ("BANANA", "Banana", "banana_defect.onnx", 37, banana_imgs[0], "banana_detector_open_box.onnx", "banana"),
+        ]
+        for code, name, fallback_model, declared_n, img_path, expected_onnx, expected_cls in cases:
+            with self.subTest(product=code):
+                product = Product(
+                    code, name, "Fruit", fallback_model, ["fresh", "bruised", "rotten"],
+                    [DefectCriterion("bruised", 0.08), DefectCriterion("rotten", 0.0, is_critical=True)],
+                )
+                order = Order(f"DEMO-{code}", product, "Vendor", total_boxes=4, expected_quantity=declared_n)
+                session = self.repo.create_session(BoxCode(order.order_code, 1, 4), order, "inspector", "STATION-01")
+                page.start_session(session)
+
+                self.assertFalse(page.apple_preset_combo.isHidden())
+                self.assertEqual(page.apple_preset_combo.currentData(), "open_box")
+                self.assertEqual(page.apple_preset_combo.findData("tray"), -1)
+                self.assertTrue(page._use_khang_detector())
+                self.assertEqual(list(page._realtime_labels.keys()), [expected_cls])
+
+                with patch.object(QFileDialog, "getOpenFileName", return_value=(str(img_path), "")):
+                    page.btn_import.click()
+
+                record = page.finalize()
+                self.assertIsNotNone(record)
+                self.assertEqual(len(record.evidence), 1)
+                ev = record.evidence[0]
+                self.assertEqual(ev.model_file, expected_onnx)
+                self.assertGreater(len(ev.units), 0)
+                self.assertEqual(record.detection.total_objects, len(ev.units))
+                self.assertFalse(record.detection.is_simulated)
+                self.assertFalse(record.detection.defect_classification_available)
+                self.assertEqual(record.assessment.recommendation, AiRecommendation.NEEDS_REVIEW)
+                self.assertEqual(order.expected_quantity, declared_n)
+                self.assertIsNotNone(page._last_container_check)
+                self.assertEqual(page._last_container_check.predicted_label, expected_cls)
+                self.assertEqual(page._last_container_check.status, "MATCH")
+                self.assertEqual(page._last_container_check.model_file, "container_4class_resnet18.onnx")
+                self.assertTrue(any(e.action == "Container Pre-Check (ResNet18)" for e in record.audit_trail))
+                self.assertIn(f"Count-only {name} detector active", page.deep_suggestion.text())
+
+    @unittest.skipUnless(
+        _KHANG_BUNDLE_READY and WORKSPACE_CLF_TEST_DIR.is_dir() and WORKSPACE_VAL_DIR.is_dir(),
+        "Optional Khang V2 bundle or classifier test images not present",
+    )
+    def test_real_4class_resnet18_empty_box_and_unsupported_advisory(self) -> None:
+        empty_box_path = WORKSPACE_CLF_TEST_DIR / "other" / "0089__empty_box_20221230.jpg"
+        self.assertTrue(empty_box_path.is_file(), f"Missing empty box image: {empty_box_path}")
+        apple_imgs = sorted(WORKSPACE_VAL_DIR.glob("*.jpg"))
+        self.assertTrue(apple_imgs)
+
+        adapter = KhangAiAdapter()
+        img_empty = QImage(str(empty_box_path))
+        self.assertFalse(img_empty.isNull())
+        res_empty = adapter.check_container(img_empty, expected_product="orange", scene_condition="single_product")
+        self.assertEqual(res_empty.predicted_label, "other")
+        self.assertNotEqual(res_empty.status, "MATCH")
+        self.assertFalse(res_empty.can_make_final_decision)
+        self.assertEqual(res_empty.model_file, "container_4class_resnet18.onnx")
+
+        img_apple = QImage(str(apple_imgs[0]))
+        self.assertFalse(img_apple.isNull())
+        res_apple = adapter.check_container(img_apple, expected_product="apple", scene_condition="single_product")
+        self.assertEqual(res_apple.predicted_label, "apple")
+        self.assertEqual(res_apple.status, "MATCH")
+        self.assertFalse(res_apple.can_make_final_decision)
+
+        res_mango = adapter.check_container(img_empty, expected_product="mango", scene_condition="single_product")
+        self.assertEqual(res_mango.status, "REVIEW_REQUIRED")
+        self.assertEqual(res_mango.reason, "UNSUPPORTED_PRODUCT")
+        self.assertFalse(res_mango.can_make_final_decision)
+
+    @unittest.skipUnless(_KHANG_BUNDLE_READY, "Optional Khang V2 bundle not installed")
+    def test_live_inspection_respects_operational_db_assigned_orange_model(self) -> None:
+        orange_baseline = Product(
+            "ORANGE", "Orange", "Fruit", "orange_defect.onnx",
+            ["fresh", "bruised", "rotten"], [DefectCriterion("bruised", 0.08)],
+        )
+        op_order = Order("OP-ORANGE-01", orange_baseline, "Orchard", 3, 45, lot_id=1001)
+        session = self.repo.create_session(BoxCode("OP-ORANGE-01", 1, 3), op_order, "inspector", "S1")
+        page = LiveInspectionPage(self.settings)
+        self.addCleanup(page.deleteLater)
+        self.addCleanup(page.clear_session)
+        page.start_session(session)
+        self.assertEqual(page.apple_preset_combo.currentData(), "baseline")
+        self.assertFalse(page._use_khang_detector())
+        self.assertEqual(list(page._realtime_labels.keys()), ["fresh", "bruised", "rotten"])
+
+        orange_open = Product(
+            "ORANGE", "Orange", "Fruit", "orange_detector_open_box.onnx",
+            ["fresh", "bruised", "rotten"], [DefectCriterion("bruised", 0.08)],
+        )
+        op_order_open = Order("OP-ORANGE-02", orange_open, "Orchard", 3, 45, lot_id=1002)
+        session_open = self.repo.create_session(BoxCode("OP-ORANGE-02", 1, 3), op_order_open, "inspector", "S1")
+        page.start_session(session_open)
+        self.assertEqual(page.apple_preset_combo.currentData(), "open_box")
+        self.assertTrue(page._use_khang_detector())
+        self.assertEqual(list(page._realtime_labels.keys()), ["orange"])
+
+    @unittest.skipUnless(_KHANG_BUNDLE_READY, "Optional Khang V2 bundle not installed")
+    def test_live_inspection_respects_operational_db_assigned_banana_model(self) -> None:
+        banana_baseline = Product(
+            "BANANA", "Banana", "Fruit", "banana_defect.onnx",
+            ["fresh", "bruised", "rotten"], [DefectCriterion("bruised", 0.08)],
+        )
+        op_order = Order("OP-BANANA-01", banana_baseline, "Orchard", 3, 45, lot_id=1005)
+        session = self.repo.create_session(BoxCode("OP-BANANA-01", 1, 3), op_order, "inspector", "S1")
+        page = LiveInspectionPage(self.settings)
+        self.addCleanup(page.deleteLater)
+        self.addCleanup(page.clear_session)
+        page.start_session(session)
+        self.assertEqual(page.apple_preset_combo.currentData(), "baseline")
+        self.assertFalse(page._use_khang_detector())
+        self.assertEqual(list(page._realtime_labels.keys()), ["fresh", "bruised", "rotten"])
+
+        banana_open = Product(
+            "BANANA", "Banana", "Fruit", "banana_detector_open_box.onnx",
+            ["fresh", "bruised", "rotten"], [DefectCriterion("bruised", 0.08)],
+        )
+        op_order_open = Order("OP-BANANA-02", banana_open, "Orchard", 3, 45, lot_id=1006)
+        session_open = self.repo.create_session(BoxCode("OP-BANANA-02", 1, 3), op_order_open, "inspector", "S1")
+        page.start_session(session_open)
+        self.assertEqual(page.apple_preset_combo.currentData(), "open_box")
+        self.assertTrue(page._use_khang_detector())
+        self.assertEqual(list(page._realtime_labels.keys()), ["banana"])
+
+    def test_khang_sha_rejection_unloads_fallback_and_blocks_capture(self) -> None:
+        base_eng = self._make_stub_engine()
+        khang_eng = self._make_stub_engine()
+        adapter = Mock()
+        adapter.is_available.return_value = True
+        adapter.available_presets.side_effect = lambda p="orange": ["open_box"] if str(p).lower() == "orange" else []
+        adapter.load_detector_preset.side_effect = ValueError("SHA-256 mismatch for orange_detector_open_box.onnx")
+
+        with (
+            patch("agroscan.ui.pages.live_inspection_page.YoloEngine", side_effect=[base_eng, khang_eng]),
+            patch("agroscan.ui.pages.live_inspection_page.KhangAiAdapter", return_value=adapter),
+        ):
+            page = LiveInspectionPage(self.settings)
+        self.addCleanup(page.deleteLater)
+        self.addCleanup(page.clear_session)
+
+        op_orange = Product(
+            "ORANGE", "Orange", "Fruit", "orange_detector_open_box.onnx",
+            ["fresh", "bruised", "rotten"], [DefectCriterion("bruised", 0.08)],
+        )
+        op_order = Order("OP-ORANGE-SHA", op_orange, "Orchard", 3, 45, lot_id=1003)
+        session = self.repo.create_session(BoxCode("OP-ORANGE-SHA", 1, 3), op_order, "inspector", "S1")
+        page.start_session(session)
+
+        base_eng.load_for_product.assert_not_called()
+        self.assertFalse(khang_eng.is_loaded)
+        self.assertFalse(base_eng.is_loaded)
+        self.assertFalse(page.btn_import.isEnabled())
+        self.assertFalse(page.operational_model_label.isHidden())
+        self.assertIn("SHA-256 mismatch", page.operational_model_label.text())
+
+        raw_img = QImage(100, 100, QImage.Format.Format_RGB32)
+        raw_img.fill(QColor(220, 140, 20))
+        page._capture_evidence(raw_img, "imported_image", False)
+        self.assertEqual(len(page._evidence), 0)
+        base_eng.infer.assert_not_called()
+        khang_eng.infer.assert_not_called()
+
+        # Also verify non-Khang preloaded baseline cannot silently run if Khang open_box fails SHA check
+        demo_orange = Product(
+            "ORANGE", "Orange", "Fruit", "orange_defect.onnx",
+            ["fresh", "bruised", "rotten"], [DefectCriterion("bruised", 0.08)],
+        )
+        demo_order = Order("DEMO-ORANGE-SHA", demo_orange, "Orchard", 3, 45)
+        page.start_session(self.repo.create_session(BoxCode("DEMO-ORANGE-SHA", 1, 3), demo_order, "inspector", "S1"))
+        self.assertFalse(base_eng.is_loaded)
+        self.assertFalse(khang_eng.is_loaded)
+        self.assertFalse(page.btn_import.isEnabled())
+        page._capture_evidence(raw_img, "imported_image", False)
+        self.assertEqual(len(page._evidence), 0)
+        base_eng.infer.assert_not_called()
+
+    def test_operational_failed_capture_recovers_on_valid_recapture(self) -> None:
+        page, base_eng, _khang, _adapter = self._make_page_with_stubs()
+        op_apple = Product("APPLE", "Apple", "Fruit", "apple_defect.onnx", ["fresh", "bruised", "rotten"], [])
+        op_order = Order("OP-RECOVER-01", op_apple, "Orchard", 3, 30, lot_id=1004)
+        session = self.repo.create_session(BoxCode("OP-RECOVER-01", 1, 3), op_order, "inspector", "S1")
+        page.start_session(session)
+
+        raw_fail = QImage(120, 90, QImage.Format.Format_RGB32)
+        raw_fail.fill(QColor(180, 30, 30))
+        base_eng.infer.side_effect = RuntimeError("transient onnxruntime failure")
+        page._capture_evidence(raw_fail, "imported_image", False)
+        self.assertEqual(len(page._evidence), 1)
+        self.assertEqual(page._evidence[0].model_file, "")
+        self.assertIsNone(page.finalize())
+
+        raw_ok = QImage(120, 90, QImage.Format.Format_RGB32)
+        raw_ok.fill(QColor(20, 160, 40))
+        base_eng.infer.side_effect = None
+        base_eng.infer.return_value = _make_stub_output(5)
+        page._capture_evidence(raw_ok, "imported_image", False)
+        self.assertEqual(len(page._evidence), 2)
+        self.assertEqual(page._evidence[-1].model_file, "apple_defect.onnx")
+
+        record = page.finalize()
+        self.assertIsNotNone(record)
+        self.assertEqual(len(record.evidence), 2)
+        self.assertEqual(record.detection.total_objects, 5)
 
 
 class TestVlmBr14AndBugFixes(unittest.TestCase):

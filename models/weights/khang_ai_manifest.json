@@ -1,48 +1,98 @@
 {
-  "schema": "agroscan.khang-ai-onnx-bundle/1",
-  "product": "apple",
-  "detectors": {
-    "open_box": {
-      "model_file": "apple_detector_open_box.onnx",
-      "sha256": "df94361856f9c5514d415c0b6bfb1e2d16139c912897ed6b6756556670f90353",
-      "source_weights_sha256": "2d6656d5714e61e2a5e573eb9cad4a6cebab969fb980c305892e83c3519743a2",
-      "image_size": 1280,
-      "confidence": 0.25,
-      "nms_iou": 0.55,
-      "max_det": 1000,
-      "classes": [
-        "apple"
-      ],
-      "letterbox_fill": [
-        114,
-        114,
-        114
-      ]
+  "schema": "agroscan.khang-ai-onnx-bundle/2",
+  "default_product": "apple",
+  "products": {
+    "apple": {
+      "detectors": {
+        "open_box": {
+          "model_file": "apple_detector_open_box.onnx",
+          "sha256": "df94361856f9c5514d415c0b6bfb1e2d16139c912897ed6b6756556670f90353",
+          "source_weights_sha256": "2d6656d5714e61e2a5e573eb9cad4a6cebab969fb980c305892e83c3519743a2",
+          "image_size": 1280,
+          "confidence": 0.25,
+          "nms_iou": 0.55,
+          "max_det": 1000,
+          "classes": [
+            "apple"
+          ],
+          "letterbox_fill": [
+            114,
+            114,
+            114
+          ]
+        },
+        "tray": {
+          "model_file": "apple_detector_tray.onnx",
+          "sha256": "e3a2ba9e2bd104b5eac35a7deadd3b03dca61e250ea21f3335a21182470709e4",
+          "source_weights_sha256": "f82eeb05a921845512a2d476ecba2fa42cebf4db3c0f1d26d249b6e11dfe27eb",
+          "image_size": 960,
+          "confidence": 0.25,
+          "nms_iou": 0.6,
+          "max_det": 1000,
+          "classes": [
+            "apple"
+          ],
+          "letterbox_fill": [
+            114,
+            114,
+            114
+          ]
+        }
+      }
     },
-    "tray": {
-      "model_file": "apple_detector_tray.onnx",
-      "sha256": "e3a2ba9e2bd104b5eac35a7deadd3b03dca61e250ea21f3335a21182470709e4",
-      "source_weights_sha256": "f82eeb05a921845512a2d476ecba2fa42cebf4db3c0f1d26d249b6e11dfe27eb",
-      "image_size": 960,
-      "confidence": 0.25,
-      "nms_iou": 0.6,
-      "max_det": 1000,
-      "classes": [
-        "apple"
-      ],
-      "letterbox_fill": [
-        114,
-        114,
-        114
-      ]
+    "orange": {
+      "detectors": {
+        "open_box": {
+          "model_file": "orange_detector_open_box.onnx",
+          "sha256": "95835079fab06d579e6697ff1a8f34272f01b772c3fe51da7faac8d840d9df2a",
+          "source_weights_sha256": "8e76590dc3ea718253603b0cd97abcf80903e3582f76d9057986c561ce6730c4",
+          "image_size": 1280,
+          "confidence": 0.45,
+          "nms_iou": 0.45,
+          "max_det": 1000,
+          "classes": [
+            "orange"
+          ],
+          "letterbox_fill": [
+            114,
+            114,
+            114
+          ],
+          "milestone": "M2_orange_detector_v3e"
+        }
+      }
+    },
+    "banana": {
+      "detectors": {
+        "open_box": {
+          "model_file": "banana_detector_open_box.onnx",
+          "sha256": "63c2aa9dacc59e62738d8e4737980ed8df738f21c084f2aa9ab205dc54f8b841",
+          "source_weights_sha256": "931ac22230a142456594ae372a96a0b034ffb0c549197472166f4cfd2280dc77",
+          "image_size": 1280,
+          "confidence": 0.35,
+          "nms_iou": 0.55,
+          "max_det": 1000,
+          "classes": [
+            "banana"
+          ],
+          "letterbox_fill": [
+            114,
+            114,
+            114
+          ],
+          "milestone": "M2_banana_detector_v1"
+        }
+      }
     }
   },
   "classifier": {
-    "model_file": "apple_vs_other_resnet18.onnx",
-    "sha256": "47e3fead9328d5daacfc67804f1273e87cc25b18d646c2630f30a5dfe622836a",
-    "source_weights_sha256": "f4a6209475b05583e8e9ae797fbe06704da85629eece7a2082e8ba8109c10590",
+    "model_file": "container_4class_resnet18.onnx",
+    "sha256": "9499c9243daf8d6bd8a70dface5095deaf33e58d7aef57c930d13beff9423725",
+    "source_weights_sha256": "4ae35c809e291c3c45c574efe81bef6685e336d78a36732fcb263901cc48c2c1",
     "labels": [
       "apple",
+      "orange",
+      "banana",
       "other"
     ],
     "other_label": "other",
@@ -62,10 +112,11 @@
       0.224,
       0.225
     ],
-    "temperature": 0.5,
-    "min_confidence": 0.85,
+    "temperature": 0.75,
+    "min_confidence": 0.75,
     "development_only": true,
-    "can_make_final_decision": false
+    "can_make_final_decision": false,
+    "milestone": "M2_resnet18_4class_v1"
   },
   "vlm": {
     "default_backend": "lm_studio",

@@ -235,6 +235,9 @@ class LiveInspectionPage(QWidget):
         )
         self._yolo_worker, self._khang_yolo_worker = self._preview_lifetime.workers
         self._last_container_check: Optional[ContainerCheckResult] = None
+        self._active_khang_presets: tuple[str, ...] = ()
+        self._khang_load_error: Optional[str] = None
+        self._failed_evidence_items: set[int] = set()
 
         self._camera: Optional[QCamera] = None
         self._media_devices = QMediaDevices(self)
@@ -324,13 +327,13 @@ class LiveInspectionPage(QWidget):
         self.sim_controls_widget.setVisible(False)
         source_bar.addWidget(self.sim_controls_widget, 1)
 
-        self.apple_preset_label = QLabel("Apple Detector:")
+        self.apple_preset_label = QLabel("Detector:")
         self.apple_preset_label.setObjectName("FormLabel")
         self.apple_preset_label.setVisible(False)
         self.apple_preset_combo = QComboBox()
         self.apple_preset_combo.setObjectName("FormCombo")
-        self.apple_preset_combo.addItem("🍎 Open Box (1280)", userData="open_box")
-        self.apple_preset_combo.addItem("🍎 Tray (960)", userData="tray")
+        self.apple_preset_combo.addItem("📦 Open Box (1280)", userData="open_box")
+        self.apple_preset_combo.addItem("🥗 Tray (960)", userData="tray")
         self.apple_preset_combo.addItem("🧪 Baseline 3-Class", userData="baseline")
         self.apple_preset_combo.setFixedWidth(185)
         self.apple_preset_combo.setVisible(False)
@@ -682,6 +685,8 @@ class LiveInspectionPage(QWidget):
         self._stop_camera()
         self._session_generation += 1
         self._capture_analysis_error = None
+        self._khang_load_error = None
+        self._failed_evidence_items.clear()
 
         self._session = session
         self._evidence, self._images = [], []
@@ -706,44 +711,66 @@ class LiveInspectionPage(QWidget):
             f"   ·   Inspector: {session.inspector}   ·   {session.station}"
         )
         self.status_badge.set_value(session.status)
-        model_loaded = self._yolo_engine.load_for_product(session.product)
-        if model_loaded:
-            loaded_name = self._yolo_engine.model_path.name if self._yolo_engine.model_path else ""
-            suffix = (
-                "ONNX Runtime loaded"
-                if loaded_name == session.product.model_file
-                else f"generic fallback: {loaded_name}"
-            )
-            self.model_label.setText(f"Model: {session.product.model_file}  ({suffix})")
-        else:
+        product_code = session.product.code.strip().lower()
+        avail_presets = self._available_khang_presets(product_code)
+        self._active_khang_presets = tuple(avail_presets)
+        assigned_model = session.product.model_file.strip()
+        assigned_preset = self._preset_for_khang_model_file(product_code, assigned_model, avail_presets)
+        if assigned_preset is not None:
+            # Never preload a Khang-manifested detector into the baseline engine without SHA-256 verification.
             self._yolo_engine.unload()
-            self.model_label.setText(
-                f"Model: {session.product.model_file}  (not loaded — simulated counts)"
-            )
+            self.model_label.setText(f"Model: {assigned_model}  (verifying Khang ONNX...)")
+        else:
+            model_loaded = self._yolo_engine.load_for_product(session.product)
+            if model_loaded:
+                loaded_name = self._yolo_engine.model_path.name if self._yolo_engine.model_path else ""
+                suffix = (
+                    "ONNX Runtime loaded"
+                    if loaded_name == session.product.model_file
+                    else f"generic fallback: {loaded_name}"
+                )
+                self.model_label.setText(f"Model: {session.product.model_file}  ({suffix})")
+            else:
+                self._yolo_engine.unload()
+                self.model_label.setText(
+                    f"Model: {session.product.model_file}  (not loaded — simulated counts)"
+                )
         self._last_container_check = None
         self.container_advisory_label.clear()
         self.container_advisory_label.setVisible(False)
         self._set_operational_model_warning(None)
-        is_apple_bundle = session.product.code.upper() == "APPLE" and self._khang_adapter.is_available()
-        self.apple_preset_label.setVisible(is_apple_bundle)
-        self.apple_preset_combo.setVisible(is_apple_bundle)
+        has_bundle = bool(avail_presets)
+        self.apple_preset_label.setText(f"{session.product.name} Detector:")
+        self.apple_preset_label.setVisible(has_bundle)
+        self.apple_preset_combo.setVisible(has_bundle)
         self.apple_preset_combo.blockSignals(True)
-        if is_apple_bundle:
-            assigned_model = session.product.model_file.strip()
-            if assigned_model == "apple_detector_tray.onnx":
-                desired_preset = "tray"
-            elif (
-                session.order.lot_id is not None
-                and assigned_model
-                and assigned_model not in ("apple_detector_open_box.onnx", "apple_detector_tray.onnx")
-            ):
+        self.apple_preset_combo.clear()
+        if has_bundle:
+            preset_labels = {
+                "open_box": "🍎 Open Box (1280)" if product_code == "apple" else "📦 Open Box (1280)",
+                "tray": "🍎 Tray (960)" if product_code == "apple" else "🥗 Tray (960)",
+            }
+            for preset in avail_presets:
+                self.apple_preset_combo.addItem(
+                    preset_labels.get(preset, preset.replace("_", " ").title()),
+                    userData=preset,
+                )
+            self.apple_preset_combo.addItem("🧪 Baseline 3-Class", userData="baseline")
+
+            if assigned_preset is not None:
+                desired_preset = assigned_preset
+            elif session.order.lot_id is not None and assigned_model:
                 # Operational PostgreSQL profile specifies a non-Khang detector; respect it to avoid submit rejection.
                 desired_preset = "baseline"
-            else:
+            elif "open_box" in avail_presets:
                 desired_preset = "open_box"
+            else:
+                desired_preset = avail_presets[0]
             idx = self.apple_preset_combo.findData(desired_preset)
             if idx >= 0:
                 self.apple_preset_combo.setCurrentIndex(idx)
+        else:
+            self.apple_preset_combo.addItem("🧪 Baseline 3-Class", userData="baseline")
         self.apple_preset_combo.blockSignals(False)
         self._sync_apple_detector_preset()
         self._sync_realtime_classes()
@@ -796,6 +823,8 @@ class LiveInspectionPage(QWidget):
         return assigned or None
 
     def _operational_warning_text(self) -> Optional[str]:
+        if self._khang_load_error is not None:
+            return f"Selected detector failed verification: {self._khang_load_error}"
         assigned = self._assigned_operational_model()
         if assigned is None:
             return None
@@ -812,31 +841,79 @@ class LiveInspectionPage(QWidget):
     def _model_assignment_error(self, *, demo: bool) -> Optional[str]:
         if demo:
             return None
+        if self._khang_load_error is not None:
+            return f"Selected detector failed verification: {self._khang_load_error}"
         return self._operational_warning_text()
 
     def _submission_model_error(self) -> Optional[str]:
         assigned = self._assigned_operational_model()
         if assigned is None:
             return None
-        if any((not item.demo_image) and item.model_file != assigned for item in self._evidence):
-            return (
-                f"DB profile expects '{assigned}'; captured evidence uses "
-                "a different or unverified detector. Recapture with the "
-                "assigned detector before submission."
-            )
+        if self._evidence:
+            count_item = self._evidence[-1]
+            if id(count_item) in self._failed_evidence_items or (
+                (not count_item.demo_image) and count_item.model_file != assigned
+            ):
+                return (
+                    f"DB profile expects '{assigned}'; captured evidence uses "
+                    "a different or unverified detector. Recapture with the "
+                    "assigned detector before submission."
+                )
+            if any(
+                (not item.demo_image)
+                and (id(item) not in self._failed_evidence_items)
+                and item.model_file != assigned
+                for item in self._evidence[:-1]
+            ):
+                return (
+                    f"DB profile expects '{assigned}'; captured evidence uses "
+                    "a different or unverified detector. Recapture with the "
+                    "assigned detector before submission."
+                )
         return None
 
     def _set_operational_model_warning(self, message: Optional[str]) -> None:
         self.operational_model_label.setText(message or "")
         self.operational_model_label.setVisible(bool(message))
 
-    def _use_khang_apple_detector(self) -> bool:
+    def _available_khang_presets(self, product_code: str) -> list[str]:
+        code = product_code.strip().lower()
+        if not code or not self._khang_adapter.is_available(code):
+            return []
+        raw = self._khang_adapter.available_presets(code)
+        if isinstance(raw, (list, tuple)) and raw:
+            return [str(p) for p in raw]
+        # Backwards-compatible fallback when unit tests mock adapter.is_available() only.
+        if code == "apple":
+            return ["open_box", "tray"]
+        return ["open_box"]
+
+    @staticmethod
+    def _preset_for_khang_model_file(
+        product_code: str,
+        model_file: str,
+        presets: list[str],
+    ) -> Optional[str]:
+        normalized = model_file.strip()
+        if not normalized:
+            return None
+        for preset in presets:
+            if normalized == f"{product_code}_detector_{preset}.onnx":
+                return preset
+        return None
+
+    def _use_khang_detector(self) -> bool:
+        preset = self.apple_preset_combo.currentData()
         return (
             self._session is not None
-            and self._session.product.code.upper() == "APPLE"
-            and self.apple_preset_combo.currentData() in ("open_box", "tray")
+            and isinstance(preset, str)
+            and preset != "baseline"
+            and preset in self._active_khang_presets
             and self._khang_apple_engine.is_loaded
         )
+
+    def _use_khang_apple_detector(self) -> bool:
+        return self._use_khang_detector()
 
     def _sync_realtime_classes(self) -> None:
         if self._session is None:
@@ -844,11 +921,15 @@ class LiveInspectionPage(QWidget):
             self._build_realtime_rows([])
             self.realtime_total.setText("—")
             return
-        classes = (
-            ["apple"]
-            if (self._use_khang_apple_detector() and not self._is_sim_mode)
-            else list(self._session.product.detect_classes)
-        )
+        if self._use_khang_detector() and not self._is_sim_mode:
+            engine_classes = getattr(self._khang_apple_engine, "class_names", None)
+            classes = (
+                list(engine_classes)
+                if isinstance(engine_classes, (list, tuple)) and engine_classes
+                else [self._session.product.code.lower()]
+            )
+        else:
+            classes = list(self._session.product.detect_classes)
         self._frame_history = {cls: deque(maxlen=self._SMOOTHING_FRAMES) for cls in classes}
         self._build_realtime_rows(classes)
         self.realtime_total.setText("—")
@@ -856,15 +937,27 @@ class LiveInspectionPage(QWidget):
     def _sync_apple_detector_preset(self) -> None:
         self._invalidate_preview()
         self._preview_lifetime.stop()
+        self._khang_load_error = None
         preset = self.apple_preset_combo.currentData()
+        product_code = self._session.product.code.strip().lower() if self._session is not None else ""
         if (
             self._session is None
-            or self._session.product.code.upper() != "APPLE"
-            or not self._khang_adapter.is_available()
-            or preset not in ("open_box", "tray")
+            or not isinstance(preset, str)
+            or preset == "baseline"
+            or preset not in self._active_khang_presets
+            or not self._khang_adapter.is_available(product_code)
         ):
             self._khang_apple_engine.unload()
-            if self._session is not None and self._session.product.code.upper() == "APPLE":
+            if self._session is not None:
+                if (
+                    preset == "baseline"
+                    and not self._yolo_engine.is_loaded
+                    and self._preset_for_khang_model_file(
+                        product_code, self._session.product.model_file, list(self._active_khang_presets)
+                    )
+                    is None
+                ):
+                    self._yolo_engine.load_for_product(self._session.product)
                 if self._yolo_engine.is_loaded:
                     loaded_name = self._yolo_engine.model_path.name if self._yolo_engine.model_path else self._session.product.model_file
                     self.model_label.setText(f"Model: {loaded_name} (ONNX Runtime loaded)")
@@ -873,13 +966,19 @@ class LiveInspectionPage(QWidget):
             self._update_buttons()
             return
         try:
-            meta = self._khang_adapter.load_detector_preset(self._khang_apple_engine, str(preset))
+            meta = self._khang_adapter.load_detector_preset(
+                self._khang_apple_engine,
+                preset,
+                product_code=product_code,
+            )
             self.model_label.setText(
                 f"Model: {meta['model_file']} ({preset} · {meta['image_size']}px ONNX)"
             )
         except Exception as exc:
             self._khang_apple_engine.unload()
-            self.model_label.setText(f"Apple ONNX preset unavailable: {exc}")
+            self._yolo_engine.unload()
+            self._khang_load_error = str(exc)
+            self.model_label.setText(f"{self._session.product.name} ONNX preset unavailable: {exc}")
         self._sync_realtime_classes()
         self._set_operational_model_warning(self._operational_warning_text())
         self._update_buttons()
@@ -888,12 +987,15 @@ class LiveInspectionPage(QWidget):
         self._stop_camera()
         self._session_generation += 1
         self._capture_analysis_error = None
+        self._khang_load_error = None
+        self._failed_evidence_items.clear()
         self._session = None
         self._evidence.clear()
         self._images.clear()
         self._session_audit.clear()
         self._detection = self._deep_analysis = None
         self._last_container_check = None
+        self._active_khang_presets = ()
         self._khang_apple_engine.unload()
         self.apple_preset_label.setVisible(False)
         self.apple_preset_combo.setVisible(False)
@@ -1040,11 +1142,12 @@ class LiveInspectionPage(QWidget):
         self._preview_requests.clear()
 
     def _preview_detector_tag(self) -> str:
-        role = (
-            "khang"
-            if self._use_khang_apple_detector() and not self._is_sim_mode
-            else "baseline"
-        )
+        if self._use_khang_detector() and not self._is_sim_mode:
+            code = self._session.product.code.lower() if self._session is not None else "unknown"
+            preset = self.apple_preset_combo.currentData() or "default"
+            role = f"khang:{code}:{preset}"
+        else:
+            role = "baseline"
         return f"{role}:{self._preview_revision}"
 
     def _submit_preview(self, image: QImage, *, simulation: bool) -> None:
@@ -1291,10 +1394,12 @@ class LiveInspectionPage(QWidget):
         self._last_container_check = None
         self._capture_analysis_error = None
         try:
-            if not demo and self._use_khang_apple_detector():
+            if not demo and self._use_khang_detector():
                 try:
-                    precheck = self._khang_adapter.check_apple_container(
-                        image, scene_condition="single_product"
+                    precheck = self._khang_adapter.check_container(
+                        image,
+                        expected_product=self._session.product.code.lower(),
+                        scene_condition="single_product",
                     )
                     self._last_container_check = precheck
                     if precheck.status == "MATCH":
@@ -1304,7 +1409,7 @@ class LiveInspectionPage(QWidget):
                     else:
                         self.container_advisory_label.setText(
                             f"▲ Advisory Pre-Check: predicted '{precheck.predicted_label}' "
-                            f"({precheck.confidence:.0%}, {precheck.status}) — verify container is APPLE."
+                            f"({precheck.confidence:.0%}, {precheck.status}) — verify container is {self._session.product.code.upper()}."
                         )
                     self.container_advisory_label.setVisible(True)
                     self._session_audit.append(
@@ -1336,9 +1441,9 @@ class LiveInspectionPage(QWidget):
                 display_image = draw_detections_on_qimage(
                     image,
                     yolo_out.boxes,
-                    fps_text=f"Apple ONNX · {yolo_out.inference_ms:.1f} ms",
+                    fps_text=f"{self._session.product.name} ONNX · {yolo_out.inference_ms:.1f} ms",
                 )
-            elif self._yolo_engine.is_loaded:
+            elif self._khang_load_error is None and self._yolo_engine.is_loaded:
                 yolo_out = self._yolo_engine.infer(image, track=True)
                 if self._yolo_engine.model_path is not None:
                     item.model_file = self._yolo_engine.model_path.name
@@ -1368,6 +1473,8 @@ class LiveInspectionPage(QWidget):
         self._deep_analysis = None
         self.vlm_panel.set_idle()
         self.btn_deep.setText(tr("live.deep_btn"))
+        if self._capture_analysis_error is not None:
+            self._failed_evidence_items.add(id(item))
         self._evidence.append(item)
         self._images.append(display_image)
         self.evidence_strip.add_thumbnail(item, display_image)
@@ -1409,7 +1516,7 @@ class LiveInspectionPage(QWidget):
         count_only = not self._detection.defect_classification_available
         if count_only:
             self.deep_suggestion.setText(
-                "▲  Count-only Apple detector active — run Deep Analysis (Qwen-VL) / manual review for defects."
+                f"▲  Count-only {self._session.product.name} detector active — run Deep Analysis (Qwen-VL) / manual review for defects."
             )
         else:
             self.deep_suggestion.setText("▲  Low detection confidence — deep analysis recommended.")
