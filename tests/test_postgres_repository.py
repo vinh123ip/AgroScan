@@ -46,6 +46,7 @@ from agroscan.main import create_repository
 from agroscan.services.app_settings import AppSettings
 from agroscan.ui.main_window import MainWindow
 from agroscan.ui.navigation import PageKey
+from agroscan.ui.pages.data_import_page import DataImportPage, write_order_template
 from agroscan.ui.theme import apply_theme
 
 _APP: QApplication | None = None
@@ -365,6 +366,192 @@ class TestPostgresRepositoryLive(unittest.TestCase):
             )
             self.assertTrue(pdf_path.is_file() and pdf_path.stat().st_size > 1000)
             self.assertTrue(xlsx_path.is_file() and xlsx_path.stat().st_size > 1000)
+
+    def test_multi_batch_excel_import_list_get_and_rollback(self) -> None:
+        import openpyxl
+
+        with self.isolated_writes(), tempfile.TemporaryDirectory() as tmp:
+            admin = self.repo.save_user(
+                f"imp-{uuid4().hex}", "Import Admin", Role.ADMIN, password="Temporary-Pass-123",
+            )
+            # Draft (unapproved) product must be rejected on import
+            draft_code = f"DRF{uuid4().hex[:8].upper()}"
+            self.repo.save_product(
+                Product(draft_code, "Draft Mango", "agricultural", "fruit_defect.onnx",
+                        ["fresh", "bruised"], [DefectCriterion("bruised", 0.10)])
+            )
+
+            order_a = f"IMP-{uuid4().hex[:8].upper()}"
+            order_b = f"IMP-{uuid4().hex[:8].upper()}"
+            order_c = f"IMP-{uuid4().hex[:8].upper()}"
+
+            # 1. File with valid row + mismatched goods_category -> all-or-nothing rejection
+            bad_cat_csv = Path(tmp) / "bad_category.csv"
+            bad_cat_csv.write_text(
+                "order_code,batch,product_code,goods_category,supplier,lot_size,expected_quantity\n"
+                f"{order_a},LOT-A,APPLE,agricultural,Da Lat,3,30\n"
+                f"{order_b},LOT-01,APPLE,aquatic,Da Lat,2,20\n",
+                encoding="utf-8",
+            )
+            imported, issues = self.repo.import_order_file(bad_cat_csv, actor=admin.username)
+            self.assertEqual(imported, 0)
+            self.assertEqual([(i.row, i.field) for i in issues], [(3, "Goods Category")])
+            self.assertEqual(self.repo.get_order(order_a), [])
+            self.assertEqual(self.repo.get_order(order_b), [])
+
+            # 2. Duplicate batch within same order, unknown product, and unapproved profile
+            bad_rules_csv = Path(tmp) / "bad_rules.csv"
+            bad_rules_csv.write_text(
+                "order_code,batch,product_code,goods_category,supplier,lot_size,expected_quantity\n"
+                f"{order_a},LOT-A,APPLE,agricultural,Da Lat,3,30\n"
+                f"{order_a},LOT-A,BANANA,agricultural,Da Lat,2,20\n"
+                f"{order_b},LOT-01,NO_SUCH_PROD,agricultural,Da Lat,2,20\n"
+                f"{order_c},LOT-01,{draft_code},agricultural,Da Lat,2,20\n",
+                encoding="utf-8",
+            )
+            imported, issues = self.repo.import_order_file(bad_rules_csv, actor=admin.username)
+            self.assertEqual(imported, 0)
+            self.assertEqual(
+                {(i.row, i.field) for i in issues},
+                {(3, "Batch"), (4, "Product Code"), (5, "Product Code")},
+            )
+            self.assertEqual(self.repo.get_order(order_a), [])
+
+            # 3. Valid multi-batch CSV -> 1 order, 2 lots, 5 boxes, 2 audit_logs
+            good_csv = Path(tmp) / "good.csv"
+            good_csv.write_text(
+                "order_code,batch,product_code,goods_category,supplier,lot_size,expected_quantity\n"
+                f"{order_a},LOT-A,APPLE,agricultural,Da Lat,3,30\n"
+                f"{order_a},LOT-B,BANANA,agricultural,Da Lat,2,20\n",
+                encoding="utf-8",
+            )
+            imported, issues = self.repo.import_order_file(good_csv, actor=admin.username)
+            self.assertEqual((imported, issues), (2, []))
+
+            lots = self.repo.get_order(order_a)
+            self.assertEqual([o.lot_code for o in lots], ["LOT-A", "LOT-B"])
+            self.assertEqual([o.total_boxes for o in lots], [3, 2])
+            self.assertEqual([o.expected_quantity for o in lots], [30, 20])
+            self.assertEqual(len(self.repo.get_order(f"{order_a}:LOT-A")), 1)
+            self.assertEqual(self.repo.get_order(order_a, lot_code="LOT-B")[0].lot_code, "LOT-B")
+            self.assertIn(f"{order_a}:LOT-A", {o.order_code for o in self.repo.list_orders()})
+            self.assertEqual(self.repo.resolve_box(f"AGS:{order_a}:LOT-A-01/03")[1].lot_code, "LOT-A")
+
+            with self.repo._connection() as conn, conn.cursor() as cur:
+                cur.execute("SELECT id FROM agroscan.orders WHERE order_code=%s", (order_a,))
+                order_rows = cur.fetchall()
+                self.assertEqual(len(order_rows), 1)
+                order_id = order_rows[0][0]
+                cur.execute(
+                    "SELECT lot_code, declared_boxes FROM agroscan.lots WHERE order_id=%s ORDER BY lot_code",
+                    (order_id,),
+                )
+                self.assertEqual(cur.fetchall(), [("LOT-A", 3), ("LOT-B", 2)])
+                cur.execute(
+                    "SELECT count(*) FROM agroscan.boxes b JOIN agroscan.lots l ON l.id=b.lot_id WHERE l.order_id=%s",
+                    (order_id,),
+                )
+                self.assertEqual(cur.fetchone()[0], 5)
+                cur.execute(
+                    "SELECT count(*) FROM agroscan.audit_logs WHERE action='order_imported' AND target_key=%s",
+                    (str(order_id),),
+                )
+                self.assertEqual(cur.fetchone()[0], 2)
+
+            # 4. Valid Excel (.xlsx) import
+            good_xlsx = Path(tmp) / "good.xlsx"
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            ws.append(["order_code", "batch", "product_code", "goods_category", "supplier", "lot_size", "expected_quantity"])
+            ws.append([order_b, "LOT-X", "SHRIMP", "aquatic", "Ca Mau Seafood", 4, 100])
+            wb.save(good_xlsx)
+            imported_xlsx, issues_xlsx = self.repo.import_order_file(good_xlsx, actor=admin.username)
+            self.assertEqual((imported_xlsx, issues_xlsx), (1, []))
+            xlsx_lots = self.repo.get_order(order_b)
+            self.assertEqual((xlsx_lots[0].lot_code, xlsx_lots[0].total_boxes, xlsx_lots[0].expected_quantity), ("LOT-X", 4, 100))
+
+            # 5. Re-importing duplicate order code is rejected without creating duplicates
+            dup_imported, dup_issues = self.repo.import_order_file(good_csv, actor=admin.username)
+            self.assertEqual(dup_imported, 0)
+            self.assertTrue(dup_issues and all(i.field == "Order Code" for i in dup_issues))
+
+            # 6. Mid-transaction DB conflict rolls back earlier inserts in the same batch
+            rollback_order = f"IMP-{uuid4().hex[:8].upper()}"
+            with patch("agroscan.services.postgres_repository.order_codes", return_value=set()):
+                rb_imported, rb_issues = self.repo.import_orders(
+                    [
+                        {
+                            "order_code": rollback_order, "batch": "LOT-01", "product_code": "APPLE",
+                            "goods_category": "agricultural", "supplier": "Da Lat", "lot_size": 2, "expected_quantity": 20,
+                        },
+                        {
+                            "order_code": order_a, "batch": "LOT-C", "product_code": "APPLE",
+                            "goods_category": "agricultural", "supplier": "Da Lat", "lot_size": 2, "expected_quantity": 20,
+                        },
+                    ],
+                    actor=admin.username,
+                    source_file="conflict.csv",
+                )
+            self.assertEqual(rb_imported, 0)
+            self.assertEqual(len(rb_issues), 1)
+            self.assertEqual(rb_issues[0].field, "Order Code")
+            self.assertEqual(self.repo.get_order(rollback_order), [])
+
+    def test_data_import_page_live_postgres_flow(self) -> None:
+        import openpyxl
+
+        with self.isolated_writes(), tempfile.TemporaryDirectory() as tmp:
+            admin = self.repo.save_user(
+                f"uiimp-{uuid4().hex}", "UI Import Admin", Role.ADMIN, password="Temporary-Pass-123",
+            )
+            page = DataImportPage(self.repo, actor=admin.username)
+            try:
+                initial_count = page.orders_table.rowCount()
+
+                # Template saved from live PostgreSQL mode uses real DB categories ('agricultural')
+                tpl_xlsx = write_order_template(Path(tmp) / "tpl.xlsx", products=self.repo.products)
+                tpl_wb = openpyxl.load_workbook(tpl_xlsx, read_only=True, data_only=True)
+                try:
+                    tpl_rows = list(tpl_wb.active.iter_rows(values_only=True))
+                finally:
+                    tpl_wb.close()
+                self.assertEqual(len(tpl_rows), 4)
+                self.assertEqual(tpl_rows[1][3], "agricultural")
+
+                # Invalid file locks Import button and shows row/column error
+                bad_csv = Path(tmp) / "bad_ui.csv"
+                bad_csv.write_text(
+                    "order_code,batch,product_code,goods_category,supplier,lot_size,expected_quantity\n"
+                    f"UIBAD-{uuid4().hex[:6].upper()},LOT-01,APPLE,aquatic,Da Lat,3,30\n",
+                    encoding="utf-8",
+                )
+                issues = page.load_file(bad_csv)
+                self.assertEqual([(i.row, i.field) for i in issues], [(2, "Goods Category")])
+                self.assertFalse(page.btn_commit.isEnabled())
+                self.assertIn("Goods Category", page.status_label.text())
+
+                # Load valid unique multi-batch Excel and commit to PostgreSQL (rolled back by isolated_writes)
+                ui_order = f"UI-{uuid4().hex[:8].upper()}"
+                good_xlsx = Path(tmp) / "good_ui.xlsx"
+                wb = openpyxl.Workbook()
+                ws = wb.active
+                ws.append(["order_code", "batch", "product_code", "goods_category", "supplier", "lot_size", "expected_quantity"])
+                ws.append([ui_order, "LOT-A", "BANANA", "agricultural", "Mekong Fresh Supply", 4, 80])
+                ws.append([ui_order, "LOT-B", "APPLE", "agricultural", "Mekong Fresh Supply", 2, 40])
+                wb.save(good_xlsx)
+
+                self.assertEqual(page.load_file(good_xlsx), [])
+                self.assertTrue(page.btn_commit.isEnabled())
+                self.assertEqual(page.preview_table.rowCount(), 2)
+                imported, errors = page.commit_staged_orders()
+                self.assertEqual((imported, errors), (2, []))
+                self.assertIn("Successfully imported 2", page.status_label.text())
+                self.assertEqual(page.orders_table.rowCount(), initial_count + 2)
+                self.assertEqual([o.lot_code for o in self.repo.get_order(ui_order)], ["LOT-A", "LOT-B"])
+            finally:
+                page.close()
+                page.deleteLater()
+                QApplication.processEvents()
 
 
 if __name__ == "__main__":

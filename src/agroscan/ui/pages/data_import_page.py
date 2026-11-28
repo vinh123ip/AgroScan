@@ -1,4 +1,4 @@
-"""Data Import Page — CSV & Excel (.xlsx) order batch import with templates (T3.4, D-029)."""
+"""Data Import Page — CSV & Excel (.xlsx) order/lot import with all-or-nothing commit (T3.4, D-029)."""
 
 from __future__ import annotations
 
@@ -18,89 +18,71 @@ from PySide6.QtWidgets import (
 )
 
 from agroscan.services.mock_repository import MockRepository
+from agroscan.services.order_import import (
+    DEFAULT_BATCH,
+    TEMPLATE_HEADERS,
+    ImportFileError,
+    ImportIssue,
+    ParsedRow,
+    as_parsed_rows,
+    check_headers,
+    parse_order_file,
+    validate_rows,
+)
 from agroscan.services.postgres_repository import PostgresRepository
 from agroscan.ui.components.data_table import DataTable
 from agroscan.ui.components.page_layout import PageHeader, ScrollPage, SectionCard, make_hint
 from agroscan.ui.formatting import fmt_datetime
 
-TEMPLATE_HEADERS = [
-    "order_code",
-    "product_code",
-    "supplier",
-    "total_boxes",
-    "expected_quantity",
-]
-
+# Same order, two batches (lots) — shows the order -> lots relationship.
+# Categories default to Database Design v1.2 seed values ('agricultural').
 SAMPLE_TEMPLATE_ROWS = [
-    ["DH00201", "BANANA", "Mekong Fresh Supply", "12", "300"],
-    ["DH00202", "APPLE", "Da Lat Orchard Co.", "8", "200"],
+    ["DH00201", "LOT-A", "BANANA", "agricultural", "Mekong Fresh Supply", "12", "300"],
+    ["DH00201", "LOT-B", "BANANA", "agricultural", "Mekong Fresh Supply", "8", "200"],
+    ["DH00202", "LOT-01", "APPLE", "agricultural", "Da Lat Orchard Co.", "8", "200"],
 ]
 
 
-def write_order_template(output_path: Union[Path, str]) -> Path:
+def _sample_rows_for(products=None) -> list[list[str]]:
+    if not products:
+        return [list(row) for row in SAMPLE_TEMPLATE_ROWS]
+    by_code = {p.code.upper(): p.category for p in products}
+    return [
+        [row[0], row[1], row[2], by_code.get(row[2].upper(), row[3]), row[4], row[5], row[6]]
+        for row in SAMPLE_TEMPLATE_ROWS
+    ]
+
+
+def write_order_template(output_path: Union[Path, str], *, products=None) -> Path:
     """Write a sample CSV or Excel (.xlsx) template file for order import."""
     target = Path(output_path)
     target.parent.mkdir(parents=True, exist_ok=True)
+    rows = _sample_rows_for(products)
     if target.suffix.lower() == ".xlsx":
         wb = openpyxl.Workbook()
         ws = wb.active
         ws.title = "Orders"
-        ws.append(TEMPLATE_HEADERS)
-        for row in SAMPLE_TEMPLATE_ROWS:
+        ws.append(list(TEMPLATE_HEADERS))
+        for row in rows:
             ws.append(row)
         wb.save(str(target))
     else:
         with target.open("w", encoding="utf-8", newline="") as f:
             writer = csv.writer(f)
             writer.writerow(TEMPLATE_HEADERS)
-            writer.writerows(SAMPLE_TEMPLATE_ROWS)
+            writer.writerows(rows)
     return target
 
 
 def parse_import_file(file_path: Union[Path, str]) -> list[dict[str, str]]:
-    """Parse an order import CSV or Excel (.xlsx) file into a list of row dicts."""
-    path = Path(file_path)
-    if not path.is_file():
-        raise FileNotFoundError(f"Import file not found: {path}")
-
-    if path.suffix.lower() == ".xlsx":
-        wb = openpyxl.load_workbook(str(path), read_only=True, data_only=True)
-        ws = wb.active
-        rows_iter = list(ws.iter_rows(values_only=True))
-        wb.close()
-        if not rows_iter:
-            return []
-        headers = [str(h or "").strip().lower() for h in rows_iter[0]]
-        result: list[dict[str, str]] = []
-        for raw_row in rows_iter[1:]:
-            if not raw_row or all(cell is None or str(cell).strip() == "" for cell in raw_row):
-                continue
-            row_dict = {
-                headers[i]: str(raw_row[i] if raw_row[i] is not None else "").strip()
-                for i in range(min(len(headers), len(raw_row)))
-                if headers[i]
-            }
-            result.append(row_dict)
-        return result
-
-    with path.open("r", encoding="utf-8-sig", newline="") as f:
-        reader = csv.DictReader(f)
-        rows: list[dict[str, str]] = []
-        for raw in reader:
-            cleaned = {
-                (k or "").strip().lower(): (v or "").strip()
-                for k, v in raw.items()
-                if k is not None
-            }
-            if any(cleaned.values()):
-                rows.append(cleaned)
-        return rows
+    """Parse an order import CSV or Excel file into normalized row dicts."""
+    return [row.values for row in as_parsed_rows(parse_order_file(file_path).rows)]
 
 
 class DataImportPage(ScrollPage):
-    """Minimal CSV / Excel order import page with validation preview and DB commit."""
+    """CSV / Excel order import page with row-level validation preview and atomic DB commit."""
 
-    orders_imported = Signal(int)  # number of imported orders
+    orders_imported = Signal(int)  # number of imported lots
 
     def __init__(self, repo: MockRepository | PostgresRepository,
                  parent: Optional[QWidget] = None, *, actor: str = "") -> None:
@@ -108,7 +90,7 @@ class DataImportPage(ScrollPage):
         self._repo = repo
         self._actor = actor
         self._source_file = ""
-        self._staged_rows: list[dict[str, str]] = []
+        self._staged_rows: list[ParsedRow] = []
         self._init_ui()
         self.refresh()
 
@@ -121,12 +103,13 @@ class DataImportPage(ScrollPage):
             )
         )
 
-        # Toolbar card
         action_card = SectionCard("1. Template & File Selection")
         action_card.body.addWidget(
             make_hint(
-                "Required columns: order_code, product_code, supplier, total_boxes, expected_quantity. "
-                "Supports both .csv (UTF-8) and .xlsx (Excel)."
+                "Required columns: order_code, product_code, supplier, lot_size (boxes in the lot), "
+                "expected_quantity. Optional: batch (default LOT-01), goods_category (checked against "
+                "the product). One row per batch; rows with the same order_code form one order. "
+                "Any invalid row rejects the whole file. Supports .csv (UTF-8) and .xlsx."
             )
         )
         btn_row = QHBoxLayout()
@@ -138,7 +121,7 @@ class DataImportPage(ScrollPage):
         self.btn_template_xlsx.setObjectName("SecondaryButton")
         self.btn_load_file = QPushButton("📂  Load CSV / Excel File…")
         self.btn_load_file.setObjectName("SecondaryButton")
-        self.btn_commit = QPushButton("✔  Import Valid Orders to DB")
+        self.btn_commit = QPushButton("✔  Import File to DB")
         self.btn_commit.setObjectName("PrimaryButton")
         self.btn_commit.setEnabled(False)
 
@@ -160,18 +143,20 @@ class DataImportPage(ScrollPage):
 
         self.status_label = QLabel("No file loaded yet.")
         self.status_label.setObjectName("HintLabel")
+        self.status_label.setWordWrap(True)
         action_card.body.addWidget(self.status_label)
         self.body.addWidget(action_card)
 
-        # Preview table
         preview_card = SectionCard("2. Staged Import Preview & Row Validation")
         self.preview_table = DataTable(
             [
                 "Row",
                 "Order Code",
+                "Batch",
                 "Product Code",
+                "Goods Category",
                 "Supplier",
-                "Total Boxes",
+                "Lot Size",
                 "Expected Qty",
                 "Validation Status",
             ]
@@ -180,7 +165,6 @@ class DataImportPage(ScrollPage):
         preview_card.body.addWidget(self.preview_table)
         self.body.addWidget(preview_card)
 
-        # Current Orders in DB
         orders_card = SectionCard("3. Existing Orders in Database")
         self.orders_table = DataTable(
             ["Order Code", "Lot", "Product", "Supplier", "Total Boxes",
@@ -196,59 +180,55 @@ class DataImportPage(ScrollPage):
         self.btn_load_file.clicked.connect(self._on_browse_file)
         self.btn_commit.clicked.connect(self.commit_staged_orders)
 
-    def _validate_row(self, row: dict[str, str]) -> tuple[bool, str]:
-        order_code = (row.get("order_code") or "").strip().upper()
-        product_code = (row.get("product_code") or "").strip().upper()
-        supplier = (row.get("supplier") or "").strip()
-        if not order_code or not product_code or not supplier:
-            return False, "✖ Missing required field(s)"
-        if self._repo.find_product(product_code) is None:
-            return False, f"✖ Unknown product '{product_code}'"
-        try:
-            boxes = int((row.get("total_boxes") or "0").strip())
-            qty = int((row.get("expected_quantity") or "0").strip())
-            if boxes < 1 or qty < 1:
-                return False, "✖ Boxes & Qty must be >= 1"
-        except ValueError:
-            return False, "✖ Invalid integer in Boxes/Qty"
-        exists = order_code in self._repo.orders
-        if exists and isinstance(self._repo, PostgresRepository):
-            return False, "Order already exists"
-        action = "Update existing" if exists else "New order"
-        return True, f"✔ Ready ({action})"
+    def _validate(self, rows: list[ParsedRow]) -> list[ImportIssue]:
+        if isinstance(self._repo, PostgresRepository):
+            return self._repo.validate_orders(rows)[1]
+        products = {p.code: p.category for p in self._repo.products}
+        existing = {k.split(":", 1)[0].upper() for k in self._repo.orders}
+        return validate_rows(rows, products, existing)[1]
 
-    def load_file(self, file_path: Union[Path, str]) -> int:
-        """Load and validate rows from ``file_path`` into the preview table."""
-        rows = parse_import_file(file_path)
-        self._staged_rows = rows
+    def load_file(self, file_path: Union[Path, str]) -> list[ImportIssue]:
+        """Parse and validate ``file_path`` into the preview; return all issues found.
+
+        Raises:
+            ImportFileError: The file cannot be read as an import table.
+        """
+        parsed = parse_order_file(file_path)
+        rows = as_parsed_rows(parsed.rows)
+        issues = check_headers(parsed.headers) or self._validate(rows)
+        self._staged_rows = [] if issues else rows
         self._source_file = Path(file_path).name
-        preview_rows: list[list[str]] = []
-        valid_count = 0
-        for idx, row in enumerate(rows, start=1):
-            ok, msg = self._validate_row(row)
-            if ok:
-                valid_count += 1
-            preview_rows.append(
-                [
-                    str(idx),
-                    (row.get("order_code") or "").upper(),
-                    (row.get("product_code") or "").upper(),
-                    row.get("supplier") or "",
-                    row.get("total_boxes") or "",
-                    row.get("expected_quantity") or "",
-                    msg,
-                ]
-            )
-        self.preview_table.set_rows(preview_rows, rows)
-        self.btn_commit.setEnabled(valid_count > 0)
-        self.status_label.setText(
-            f"Loaded {len(rows)} row(s) from {Path(file_path).name}: "
-            f"{valid_count} valid, {len(rows) - valid_count} invalid."
-        )
-        return valid_count
 
-    def commit_staged_orders(self) -> tuple[int, list[str]]:
-        """Commit valid staged rows into the repository."""
+        by_row: dict[int, list[ImportIssue]] = {}
+        for issue in issues:
+            by_row.setdefault(issue.row, []).append(issue)
+        preview_rows = []
+        for row in rows:
+            v = row.values
+            problems = by_row.get(row.row_number, [])
+            status = ("✖ " + "; ".join(f"{i.field}: {i.message}" for i in problems)) if problems else "✔ Ready"
+            preview_rows.append([
+                str(row.row_number), v.get("order_code", "").upper(),
+                v.get("batch", "").upper() or DEFAULT_BATCH,
+                v.get("product_code", "").upper(), v.get("goods_category", ""), v.get("supplier", ""),
+                v.get("lot_size", ""), v.get("expected_quantity", ""), status,
+            ])
+        self.preview_table.set_rows(preview_rows, rows)
+        self.btn_commit.setEnabled(not issues and bool(rows))
+
+        name = Path(file_path).name
+        if issues:
+            file_issues = by_row.get(None, [])
+            first = str(file_issues[0]) if file_issues else str(issues[0])
+            self.status_label.setText(
+                f"✖ {name}: {len(issues)} issue(s) in {len(rows)} row(s); the file will not be imported. {first}"
+            )
+        else:
+            self.status_label.setText(f"Loaded {len(rows)} row(s) from {name}: all valid, ready to import.")
+        return issues
+
+    def commit_staged_orders(self) -> tuple[int, list]:
+        """Import the staged file atomically; nothing is stored if any row fails."""
         if not self._staged_rows:
             return 0, ["No rows staged."]
         if isinstance(self._repo, PostgresRepository):
@@ -262,11 +242,9 @@ class DataImportPage(ScrollPage):
         self.btn_commit.setEnabled(False)
         self.refresh()
         if errors:
-            self.status_label.setText(
-                f"Imported {imported} order(s), skipped {len(errors)}. {errors[0]}"
-            )
+            self.status_label.setText(f"✖ Import rejected, nothing was stored. {errors[0]}")
         else:
-            self.status_label.setText(f"✔  Successfully imported {imported} order(s) into database.")
+            self.status_label.setText(f"✔  Successfully imported {imported} lot row(s) into database.")
         if imported > 0:
             self.orders_imported.emit(imported)
         return imported, errors
@@ -297,7 +275,7 @@ class DataImportPage(ScrollPage):
         if not path:
             return
         try:
-            out = write_order_template(path)
+            out = write_order_template(path, products=self._repo.products)
             self.status_label.setText(f"✔  Saved template to {out}")
         except Exception as exc:
             QMessageBox.critical(self, "Template Error", f"Could not write template:\n{exc}")
@@ -313,10 +291,14 @@ class DataImportPage(ScrollPage):
             return
         try:
             self.load_file(path)
+        except ImportFileError as exc:
+            self._staged_rows = []
+            self.preview_table.set_rows([])
+            self.btn_commit.setEnabled(False)
+            self.status_label.setText(f"✖ Could not read file: {exc}")
         except Exception as exc:
             QMessageBox.critical(self, "Import Error", f"Could not read file:\n{exc}")
 
     def showEvent(self, event) -> None:  # noqa: N802
         self.refresh()
         super().showEvent(event)
-

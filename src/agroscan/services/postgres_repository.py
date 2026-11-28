@@ -3,7 +3,8 @@
 from collections import Counter, defaultdict
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
-from typing import Optional
+from pathlib import Path
+from typing import Optional, Union
 from uuid import UUID, uuid4
 
 import psycopg2
@@ -19,6 +20,16 @@ from agroscan.models.vlm_models import VlmSchemaError, parse_vlm_response
 from agroscan.services.catalog_validation import validate_product
 from agroscan.services.database import DbConfig, get_connection, resolve_db_config
 from agroscan.services.evidence_service import verify_evidence_integrity
+from agroscan.services.order_import import (
+    ImportFileError,
+    ImportIssue,
+    LotRow,
+    as_parsed_rows,
+    check_headers,
+    order_codes,
+    parse_order_file,
+    validate_rows,
+)
 from agroscan.services.passwords import hash_password
 
 
@@ -42,6 +53,14 @@ _BOXES = """
     SELECT b.*, row_number() OVER (PARTITION BY lot_id ORDER BY box_code, id) AS box_number
     FROM agroscan.boxes b
 """
+
+
+class _ImportRejected(Exception):
+    """Abort the import transaction with one reportable issue."""
+
+    def __init__(self, issue: ImportIssue) -> None:
+        super().__init__(str(issue))
+        self.issue = issue
 
 
 def _local(value: datetime) -> datetime:
@@ -280,7 +299,7 @@ class PostgresRepository:
             cur.execute("DELETE FROM agroscan.inspection_profiles WHERE product_id=%s", (product_id,))
             cur.execute("DELETE FROM agroscan.products WHERE id=%s", (product_id,))
 
-    def _fetch_orders(self, conn) -> dict[str, Order]:
+    def _fetch_orders(self, conn, order_code: Optional[str] = None) -> dict[str, Order]:
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT l.id, o.order_code, l.lot_code, count(*) OVER (PARTITION BY o.id),
@@ -303,8 +322,9 @@ class PostgresRepository:
                       AND details->'lot_id'=to_jsonb(l.id)
                     ORDER BY id DESC LIMIT 1
                 ) a ON true
+                WHERE %(code)s::text IS NULL OR upper(o.order_code) = %(code)s
                 ORDER BY o.order_code, l.lot_code
-            """)
+            """, {"code": order_code.strip().upper() if order_code else None})
             orders = {}
             for lot_id, order_code, lot_code, count, supplier, boxes, imported, code, name, category, config, rules, quantity, outcome, decision_version, manifest in cur.fetchall():
                 key = order_code if count == 1 else f"{order_code}:{lot_code}"
@@ -323,67 +343,120 @@ class PostgresRepository:
         with self._connection() as conn:
             return self._fetch_orders(conn)
 
-    def import_orders(self, rows, *, actor="", source_file="") -> tuple[int, list[str]]:
-        imported, errors = 0, []
-        for index, row in enumerate(rows, 1):
-            try:
-                self._import_order(row, actor, source_file)
-            except ValueError as exc:
-                errors.append(f"Row {index}: {exc}")
-            else:
-                imported += 1
-        return imported, errors
+    def list_orders(self) -> list[Order]:
+        """Return every imported order lot, sorted by order code and batch."""
+        return list(self.orders.values())
 
-    def _import_order(self, row, actor, source_file) -> None:
-        order = str(row.get("order_code") or "").strip().upper()
-        product = str(row.get("product_code") or "").strip().upper()
-        supplier = str(row.get("supplier") or "").strip()
-        if not (order and product and supplier and source_file):
-            raise ValueError("Order code, product, supplier and source file are required.")
-        BoxCode.parse(f"AGS:{order}-01/01")
+    def get_order(self, order_code: str, *, lot_code: Optional[str] = None) -> list[Order]:
+        """Return lots matching ``order_code`` (or ``ORDER:BATCH``); empty when not found."""
+        code = (order_code or "").strip().upper()
+        if not code:
+            return []
+        target_lot = (lot_code or "").strip().upper() or None
+        if target_lot is None and ":" in code:
+            code, target_lot = code.split(":", 1)
+        with self._connection() as conn:
+            lots = list(self._fetch_orders(conn, code).values())
+        if target_lot is not None:
+            return [o for o in lots if (o.lot_code or "").upper() == target_lot]
+        return lots
+
+    def import_order_file(self, file_path: Union[Path, str], *, actor: str = "") -> tuple[int, list[ImportIssue]]:
+        """Parse, validate and atomically import a CSV or Excel order file."""
+        path = Path(file_path)
         try:
-            boxes = int(row.get("total_boxes") or 0)
-            quantity = int(row.get("expected_quantity") or 0)
-            if not 1 <= boxes <= 9999 or not 1 <= quantity <= 2147483647:
-                raise ValueError
-        except (ValueError, TypeError):
-            raise ValueError("Enter a box count from 1 to 9999 and a positive quantity.") from None
-        with self._connection() as conn, conn.cursor() as cur:
-            cur.execute("SELECT id FROM agroscan.users WHERE login=%s AND role='admin' AND active", (actor,))
-            user = cur.fetchone()
-            if not user:
-                raise ValueError("An active administrator is required to import orders.")
-            cur.execute("""
-                SELECT f.id FROM agroscan.inspection_profiles f JOIN agroscan.products p ON p.id=f.product_id
-                WHERE upper(p.code)=%s AND f.approved AND f.retired_at IS NULL
-                ORDER BY f.version DESC LIMIT 1
-            """, (product,))
-            profile = cur.fetchone()
-            if not profile:
-                raise ValueError(f"Product {product} needs an approved, active profile.")
-            cur.execute("""
-                INSERT INTO agroscan.orders (order_code,supplier,source_file)
-                VALUES (%s,%s,%s) ON CONFLICT (order_code) DO NOTHING RETURNING id
-            """, (order, supplier, source_file))
-            saved = cur.fetchone()
-            if not saved:
-                raise ValueError(f"Order {order} already exists.")
-            order_id = saved[0]
-            cur.execute("""
-                INSERT INTO agroscan.lots (order_id,profile_id,lot_code,declared_boxes)
-                VALUES (%s,%s,'LOT-01',%s) RETURNING id
-            """, (order_id, profile[0], boxes))
-            lot_id = cur.fetchone()[0]
-            cur.execute("""
-                INSERT INTO agroscan.boxes (lot_id,box_code)
-                SELECT %s, 'BOX-' || lpad(n::text,4,'0') FROM generate_series(1,%s) n
-            """, (lot_id, boxes))
-            cur.execute("""
-                INSERT INTO agroscan.audit_logs (actor_id,action,target_type,target_key,details)
-                VALUES (%s,'order_imported','order',%s,%s)
-            """, (user[0], str(order_id), Json({
-                "lot_id": lot_id, "declared_boxes": boxes, "expected_quantity": quantity
-            })))
+            parsed = parse_order_file(path)
+        except ImportFileError as exc:
+            return 0, [ImportIssue(None, None, "", str(exc))]
+        header_issues = check_headers(parsed.headers)
+        if header_issues:
+            return 0, header_issues
+        return self.import_orders(parsed.rows, actor=actor, source_file=path.name)
+
+    @staticmethod
+    def _importable_products(cur) -> dict[str, tuple[int, str]]:
+        """Product code -> (latest approved, active profile id, category)."""
+        cur.execute("""
+            SELECT DISTINCT ON (p.id) upper(p.code), f.id, p.category
+            FROM agroscan.products p JOIN agroscan.inspection_profiles f ON f.product_id=p.id
+            WHERE f.approved AND f.retired_at IS NULL
+            ORDER BY p.id, f.version DESC
+        """)
+        return {code: (profile_id, category) for code, profile_id, category in cur.fetchall()}
+
+    def _validate_orders(self, cur, rows):
+        parsed = as_parsed_rows(rows)
+        products = self._importable_products(cur)
+        cur.execute(
+            "SELECT upper(order_code) FROM agroscan.orders WHERE upper(order_code) = ANY(%s)",
+            (sorted(order_codes(parsed)),),
+        )
+        existing = [row[0] for row in cur.fetchall()]
+        lots, issues = validate_rows(parsed, {c: v[1] for c, v in products.items()}, existing)
+        return lots, issues, products
+
+    def validate_orders(self, rows) -> tuple[list[LotRow], list[ImportIssue]]:
+        """Dry-run the import checks against the database without writing."""
+        try:
+            with self._connection() as conn, conn.cursor() as cur:
+                return self._validate_orders(cur, rows)[:2]
+        except ValueError as exc:
+            return [], [ImportIssue(None, None, "", f"Database error: {exc}")]
+
+    def import_orders(self, rows, *, actor="", source_file="") -> tuple[int, list[ImportIssue]]:
+        """Validate all rows, then store every order and lot in one transaction.
+
+        All-or-nothing: any validation or database issue stores nothing and
+        returns ``(0, issues)``. Rows sharing an Order Code become one order
+        with one lot per Batch. Returns ``(lots_imported, [])`` on success.
+        """
+        if not source_file.strip():
+            return 0, [ImportIssue(None, None, "", "A source file name is required.")]
+        try:
+            with self._connection() as conn, conn.cursor() as cur:
+                cur.execute("SELECT id FROM agroscan.users WHERE login=%s AND role='admin' AND active", (actor,))
+                user = cur.fetchone()
+                if not user:
+                    return 0, [ImportIssue(None, None, "", "An active administrator is required to import orders.")]
+                lots, issues, products = self._validate_orders(cur, rows)
+                if issues:
+                    return 0, issues
+                order_ids: dict[str, int] = {}
+                for lot in lots:
+                    if lot.order_code not in order_ids:
+                        cur.execute("""
+                            INSERT INTO agroscan.orders (order_code,supplier,source_file)
+                            VALUES (%s,%s,%s) ON CONFLICT (order_code) DO NOTHING RETURNING id
+                        """, (lot.order_code, lot.supplier, source_file))
+                        saved = cur.fetchone()
+                        if not saved:
+                            raise _ImportRejected(ImportIssue(
+                                lot.row_number, "Order Code", lot.order_code,
+                                "Order Code already exists in the database.",
+                            ))
+                        order_ids[lot.order_code] = saved[0]
+                    cur.execute("""
+                        INSERT INTO agroscan.lots (order_id,profile_id,lot_code,declared_boxes)
+                        VALUES (%s,%s,%s,%s) RETURNING id
+                    """, (order_ids[lot.order_code], products[lot.product_code][0], lot.batch, lot.lot_size))
+                    lot_id = cur.fetchone()[0]
+                    cur.execute("""
+                        INSERT INTO agroscan.boxes (lot_id,box_code)
+                        SELECT %s, 'BOX-' || lpad(n::text,4,'0') FROM generate_series(1,%s) n
+                    """, (lot_id, lot.lot_size))
+                    cur.execute("""
+                        INSERT INTO agroscan.audit_logs (actor_id,action,target_type,target_key,details)
+                        VALUES (%s,'order_imported','order',%s,%s)
+                    """, (user[0], str(order_ids[lot.order_code]), Json({
+                        "lot_id": lot_id, "declared_boxes": lot.lot_size,
+                        "expected_quantity": lot.expected_quantity,
+                    })))
+                return len(lots), []
+        except _ImportRejected as exc:
+            return 0, [exc.issue]
+        except (ValueError, psycopg2.Error) as exc:
+            message = getattr(getattr(exc, "diag", None), "message_primary", None) or str(exc)
+            return 0, [ImportIssue(None, None, "", f"Database error, nothing was imported: {message}")]
 
     def resolve_box(self, text: str) -> tuple[BoxCode, Order]:
         with self._connection() as conn, conn.cursor() as cur:

@@ -11,7 +11,8 @@ import random
 from collections import defaultdict
 from dataclasses import fields
 from datetime import date, datetime, timedelta
-from typing import Optional
+from pathlib import Path
+from typing import Optional, Union
 
 from agroscan.models.inspection_models import (
     AiRecommendation,
@@ -33,6 +34,13 @@ from agroscan.models.inspection_models import (
 from agroscan.models.user_models import Role, User
 from agroscan.services import mock_ai, rule_engine
 from agroscan.services.catalog_validation import validate_product
+from agroscan.services.order_import import (
+    ImportFileError,
+    ImportIssue,
+    check_headers,
+    parse_order_file,
+    validate_rows,
+)
 from agroscan.services.mock_auth import MockAuthService
 
 
@@ -150,41 +158,62 @@ class MockRepository:
         self.orders[code] = stored
         return stored
 
-    def import_orders(self, rows: list[dict[str, object]]) -> tuple[int, list[str]]:
-        """Validate and import a batch of order dicts from CSV/Excel (T3.4)."""
-        imported = 0
-        errors: list[str] = []
-        for idx, row in enumerate(rows, start=1):
-            order_code = str(row.get("order_code") or "").strip().upper()
-            product_code = str(row.get("product_code") or "").strip().upper()
-            supplier = str(row.get("supplier") or "").strip()
-            if not order_code or not product_code or not supplier:
-                errors.append(f"Row {idx}: Missing order_code, product_code, or supplier.")
-                continue
-            product = self.find_product(product_code)
-            if product is None:
-                errors.append(f"Row {idx} ({order_code}): Product '{product_code}' does not exist.")
-                continue
-            try:
-                total_boxes = int(str(row.get("total_boxes") or "0").strip())
-                expected_qty = int(str(row.get("expected_quantity") or "0").strip())
-                if total_boxes < 1 or expected_qty < 1:
-                    raise ValueError("Boxes and quantity must be positive integers.")
-            except ValueError as exc:
-                errors.append(f"Row {idx} ({order_code}): {exc}")
-                continue
+    def list_orders(self) -> list[Order]:
+        """Return every order/lot in the in-memory store."""
+        return list(self.orders.values())
 
-            self.save_order(
-                Order(
-                    order_code=order_code,
-                    product=product,
-                    supplier=supplier,
-                    total_boxes=total_boxes,
-                    expected_quantity=expected_qty,
-                )
+    def get_order(self, order_code: str, *, lot_code: Optional[str] = None) -> list[Order]:
+        """Return orders/lots matching ``order_code`` (or ``ORDER:BATCH``)."""
+        code = (order_code or "").strip().upper()
+        if not code:
+            return []
+        target_lot = (lot_code or "").strip().upper() or None
+        if target_lot is None and ":" in code:
+            code, target_lot = code.split(":", 1)
+        matches = []
+        for key, order in self.orders.items():
+            base = key.split(":", 1)[0].upper()
+            if base != code:
+                continue
+            if target_lot is not None and (order.lot_code or "").upper() != target_lot:
+                continue
+            matches.append(order)
+        return matches
+
+    def import_order_file(self, file_path: Union[Path, str]) -> tuple[int, list[ImportIssue]]:
+        """Parse, validate and atomically import a CSV or Excel order file."""
+        try:
+            parsed = parse_order_file(file_path)
+        except ImportFileError as exc:
+            return 0, [ImportIssue(None, None, "", str(exc))]
+        header_issues = check_headers(parsed.headers)
+        if header_issues:
+            return 0, header_issues
+        return self.import_orders(parsed.rows)
+
+    def import_orders(self, rows) -> tuple[int, list[ImportIssue]]:
+        """Validate all rows and import atomically into the in-memory store."""
+        products = {p.code: p.category for p in self.products}
+        existing = {k.split(":", 1)[0].upper() for k in self.orders}
+        lots, issues = validate_rows(rows, products, existing)
+        if issues:
+            return 0, issues
+        counts = defaultdict(int)
+        for lot in lots:
+            counts[lot.order_code] += 1
+        for lot in lots:
+            key = lot.order_code if counts[lot.order_code] == 1 else f"{lot.order_code}:{lot.batch}"
+            product = self.find_product(lot.product_code)
+            assert product is not None
+            self.orders[key] = Order(
+                order_code=key,
+                product=product,
+                supplier=lot.supplier,
+                total_boxes=lot.lot_size,
+                expected_quantity=lot.expected_quantity,
+                lot_code=lot.batch,
             )
-            imported += 1
-        return imported, errors
+        return len(lots), []
 
     def save_user(
         self,
